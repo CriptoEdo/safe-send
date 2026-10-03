@@ -19,9 +19,8 @@ declare global {
 
 export const phantom = (): PhantomProvider | null => window.phantom?.solana?.isPhantom ? window.phantom.solana : null;
 
-// Wallets the user connected in this browser, each with a signature. Phantom alone would reconnect any account
-// it trusts as soon as it is selected; Safe Send only uses accounts on this list, and "Disconnect" removes one,
-// so using it again needs a new signature.
+// Wallets used with Safe Send in this browser (the "Switch wallet" list). Empty means disconnected: the first
+// connection asks for a signature, then Safe Send follows the account selected in Phantom until "Disconnect".
 const WALLETS_KEY = 'safe-send:wallets';
 
 export function connectedWallets(): string[] {
@@ -35,6 +34,10 @@ export function connectedWallets(): string[] {
 
 function saveWallets(list: string[]): void {
   try { localStorage.setItem(WALLETS_KEY, JSON.stringify(list)); } catch { /* storage unavailable */ }
+}
+
+export function rememberWallet(wallet: string): void {
+  if (!connectedWallets().includes(wallet)) saveWallets([...connectedWallets(), wallet]);
 }
 
 // The account currently selected in Phantom, without any popup (null if this site is not connected).
@@ -75,12 +78,25 @@ export async function connectWithSignature(): Promise<PublicKey | null> {
   }
 }
 
-// Removes a wallet from the connected list. The Phantom session is closed only when no wallet is left,
-// so the other connected wallets keep working.
-export async function disconnectWallet(wallet: PublicKey): Promise<void> {
-  const list = connectedWallets().filter((w) => w !== wallet.toBase58());
-  saveWallets(list);
-  if (list.length === 0) await phantom()?.disconnect().catch(() => {});
+// Phantom's approval popup for the selected account (no message to sign): used when the user switches to an
+// account that has not approved Safe Send yet. Returns the account, or null if refused.
+export async function approveAccount(): Promise<PublicKey | null> {
+  const provider = phantom();
+  if (!provider) return null;
+  try {
+    const { publicKey } = await provider.connect();
+    const wallet = new PublicKey(publicKey.toString());
+    rememberWallet(wallet.toBase58());
+    return wallet;
+  } catch {
+    return null;
+  }
+}
+
+// Disconnects Safe Send: forgets the wallets and revokes the site in Phantom.
+export async function disconnectAll(): Promise<void> {
+  saveWallets([]);
+  await phantom()?.disconnect().catch(() => {});
 }
 
 // Signs with Phantom, sends, and waits for confirmation. Returns the signature.

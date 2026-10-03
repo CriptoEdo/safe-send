@@ -7,6 +7,7 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const $ = (s: string) => document.querySelector<HTMLElement>(`#app ${s}`);
 const text = (s = '') => ((s ? $(s) : document.getElementById('app'))?.innerText ?? '').replace(/\s+/g, ' ');
 const tab = () => $('.seg.active')?.dataset.tab;
+const rpcRequests = () => performance.getEntriesByType('resource').filter((e) => e.name.includes(':8899')).length;
 const click = (s: string) => { const el = $(s); if (!el) throw new Error(`missing ${s}`); el.click(); };
 const type = (s: string, v: string) => { const el = $(s) as HTMLInputElement; el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); };
 const pick = (s: string, v: string) => { const el = $(s) as HTMLSelectElement; el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
@@ -30,11 +31,16 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     check('connect asks one signature', h.controls.messages === 1, String(h.controls.messages));
     await until(() => text('#balance').includes('2 SOL'), 'balance');
 
-    // Tabs switch instantly, many times, and stay where clicked after refreshes
+    // Tabs switch instantly, many times, stay where clicked, and do not flood the RPC
+    await wait(1000);
+    const requests = rpcRequests();
     let tabsOk = true;
-    for (const t of ['incoming', 'sent', 'send', 'sent', 'incoming', 'send', 'incoming', 'sent']) { click(`[data-tab="${t}"]`); tabsOk &&= tab() === t; }
+    for (let i = 0; i < 5; i++) {
+      for (const t of ['incoming', 'sent', 'send', 'sent', 'incoming', 'send', 'incoming', 'sent']) { click(`[data-tab="${t}"]`); tabsOk &&= tab() === t; }
+    }
     await wait(1500);
     check('rapid tab switching', tabsOk && tab() === 'sent', String(tab()));
+    check('40 tab clicks make no RPC requests', rpcRequests() === requests, String(rpcRequests() - requests));
     click('[data-tab="send"]');
 
     // Form validation and state kept across menu / tabs
@@ -44,10 +50,13 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     click('[data-menu]'); await wait(50); document.body.click(); await wait(50);
     click('[data-tab="sent"]'); click('[data-tab="send"]');
     check('form kept across menu and tabs', ($('#amount') as HTMLInputElement).value === '0.5' && ($('#recipient') as HTMLInputElement).value === B && !($('#send') as HTMLButtonElement).disabled);
-    for (const [v, expected] of [['abc', 'valid amount'], ['0', 'greater than zero'], ['5', 'Not enough SOL'], ['0.0000000001', 'valid amount']]) {
+    for (const [v, expected] of [['abc', 'valid amount'], ['0', 'greater than zero'], ['0.0000000001', 'valid amount']]) {
       type('#amount', v); click('#send');
       check(`amount "${v}" rejected`, text('#send-result').includes(expected), text('#send-result'));
     }
+    type('#amount', '5'); click('#send');
+    await until(() => $('#send-result .error'), 'too much SOL');
+    check('more SOL than the balance: clear error', text('#send-result').includes('Not enough SOL'), text('#send-result'));
     type('#recipient', 'not-an-address'); await wait(500);
     check('invalid address', text('#recipient-check').includes('Not a valid'), text('#recipient-check'));
     type('#recipient', A); await wait(500);
@@ -79,7 +88,8 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
 
     // Tokens: send to B, add B, switch, claim
     const mint = await h.mintTokens(0, 100);
-    click('[data-tab="send"]');
+    await wait(21_000); // tabs reload from the network at most every 20 s
+    click('[data-tab="incoming"]'); click('[data-tab="send"]');
     await until(() => [...($('#asset') as HTMLSelectElement).options].some((o) => o.value === mint), 'token listed');
     pick('#asset', mint);
     check('token balance', text('#balance').includes('100'), text('#balance'));
@@ -87,11 +97,10 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B token');
     click('#send');
     await until(() => $('#send-result .ok'), 'token sent');
-    click('#send-result [data-add]');
-    h.select(1); await wait(200);
-    check('untrusted account not auto-connected', !$('.wallet'), text('.top'));
-    click('[data-connect]');
-    await until(() => text('.top').includes(B.slice(0, 4)), 'B connected');
+    const messages = h.controls.messages;
+    h.select(1); // a new account in Phantom: approved with Phantom's popup, the app follows it
+    await until(() => text('.top').includes(B.slice(0, 4)), 'B followed');
+    check('switching in Phantom follows the account, no message to sign', h.controls.messages === messages, String(h.controls.messages - messages));
     await until(() => text('.segments').includes('Receive 1'), 'B incoming');
     click('[data-tab="incoming"]'); click('[data-claim]');
     await until(() => $('#list-result .ok'), 'token claim');
@@ -102,11 +111,20 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     check('switch asks to select in Phantom', text('.switch-hint').includes('Select'), text('.switch-hint'));
     h.select(0);
     await until(() => text('.top').includes(A.slice(0, 4)), 'A active');
+    h.select(1); await until(() => text('.top').includes(B.slice(0, 4)), 'back to B');
+    check('switching back in Phantom', true);
+
+    // B sends SOL back to A
+    click('[data-tab="send"]'); type('#amount', '0.1'); type('#recipient', A);
+    await until(() => !($('#send') as HTMLButtonElement).disabled, 'check A');
+    click('#send');
+    await until(() => $('#send-result .ok, #send-result .error'), 'send back');
+    check('send back from the second wallet', !!$('#send-result .ok'), text('#send-result'));
+
+    // Disconnect: switching accounts in Phantom no longer reconnects
     click('[data-menu]'); click('[data-disconnect]'); await wait(200);
-    h.select(1); await until(() => text('.top').includes(B.slice(0, 4)), 'B active');
-    h.select(0); await wait(300);
-    check('disconnected wallet stays disconnected', !$('.wallet') && text('.switch-hint').includes('not connected'), text());
-    check('list excludes disconnected wallet', !text('.wallet-list').includes(A.slice(0, 4)) && text('.wallet-list').includes(B.slice(0, 4)), text('.wallet-list'));
+    h.select(0); await wait(300); h.select(1); await wait(300);
+    check('disconnected: stays disconnected', !$('.wallet') && text().includes('Connect Phantom'), text().slice(0, 200));
   } catch (err) {
     check('suite crashed', false, String((err as Error).message));
   }

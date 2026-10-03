@@ -6,7 +6,7 @@ import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimFeeIxs, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
   newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, type FeeCheck, type PendingTransfer,
 } from './lib/safeSend.ts';
-import { connectWithSignature, connectedWallets, disconnectWallet, phantom, selectedAccount, signAndSend } from './wallet.ts';
+import { approveAccount, connectWithSignature, connectedWallets, disconnectAll, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
 const RPC_URL = import.meta.env.VITE_RPC_URL ?? 'https://api.devnet.solana.com';
 const connection = new Connection(RPC_URL, 'confirmed');
@@ -30,7 +30,6 @@ const state = {
   // A transfer opened from a shared link: shown once in the right tab.
   highlight: new URLSearchParams(location.search).get('transfer'),
   highlightShown: false,
-  linkMissing: false, // the linked transfer is not for this wallet, or was already claimed or cancelled
   busy: false, // a transaction is waiting for Phantom or the network
   menu: false, // wallet menu open
   // A connected wallet the user picked, waiting for them to select it in Phantom (Phantom signs with its own
@@ -99,7 +98,22 @@ function describeError(err: unknown): string {
 
 // --- Data ---
 
+// The public Devnet RPC rejects bursts of requests: retry a failed call a couple of times before giving up.
+async function retry<T>(call: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (attempt >= 2) throw err;
+      await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+    }
+  }
+}
+
 let refreshSeq = 0;
+let lastRefresh = 0;
+// Switching tabs reloads from the network at most this often; transactions and wallet changes always reload.
+const TAB_REFRESH_MS = 20_000;
 
 // Fetches balances and transfers of the active wallet in the background, then repaints. Results of an older
 // refresh, or of a wallet that is no longer active, are dropped.
@@ -107,15 +121,16 @@ async function refresh(): Promise<void> {
   const owner = state.wallet;
   if (!owner) return;
   const seq = ++refreshSeq;
+  lastRefresh = Date.now();
   const current = () => seq === refreshSeq && state.wallet?.equals(owner);
   try {
     const [lamports, parsed, incoming, outgoing] = await Promise.all([
-      connection.getBalance(owner),
-      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }),
-      incomingTransfers(connection, owner),
-      outgoingTransfers(connection, owner),
+      retry(() => connection.getBalance(owner)),
+      retry(() => connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID })),
+      retry(() => incomingTransfers(connection, owner)),
+      retry(() => outgoingTransfers(connection, owner)),
     ]);
-    await loadDecimals([...incoming, ...outgoing].filter((t) => !t.isSol).map((t) => t.mint));
+    await retry(() => loadDecimals([...incoming, ...outgoing].filter((t) => !t.isSol).map((t) => t.mint)));
     if (!current()) return;
     const open = (t: PendingTransfer) => !closed.has(t.address.toBase58());
     Object.assign(state, {
@@ -135,10 +150,12 @@ async function refresh(): Promise<void> {
       const tab = state.incoming.some((t) => t.address.toBase58() === state.highlight) ? 'incoming'
         : state.outgoing.some((t) => t.address.toBase58() === state.highlight) ? 'sent' : null;
       if (tab) Object.assign(state, { tab, highlightShown: true });
-      state.linkMissing = !tab;
     }
   } catch {
     if (!current()) return;
+    lastRefresh = 0; // try again on the next tab switch
+    // With data already on screen, keep it and stay quiet: the next refresh will update it.
+    if (state.loaded) return;
     state.loadError = true;
   }
   paint();
@@ -189,7 +206,7 @@ function header(): string {
           <div class="menu-label">Switch wallet</div>
           ${connectedWallets().map(walletRow).join('')}
           <button role="menuitem" data-add>＋ Add another wallet</button>
-          <button role="menuitem" class="danger" data-disconnect>Disconnect ${short(state.wallet)}</button>
+          <button role="menuitem" class="danger" data-disconnect>Disconnect</button>
         </div>` : ''}
       </div>`
     : ''; // not connected: the welcome screen has the connect button
@@ -212,14 +229,14 @@ function walletNotice(): string {
   if (state.notice?.kind === 'add') {
     return `<div class="switch-hint">
       <strong>Add another wallet</strong>
-      Select the new account in Phantom, then connect it here with a signature.
-      <button class="pill primary small" data-connect>Connect &amp; sign</button>
+      Select the other account in Phantom: Safe Send switches to it automatically.
     </div>`;
   }
   if (state.notice?.kind === 'not-connected') {
     return `<div class="switch-hint">
       <strong>${state.notice.account ? `${short(state.notice.account)} is not connected` : 'This Phantom account is not connected'}</strong>
-      Connect it with a signature to use it here${connectedWallets().length ? ', or pick one of your wallets' : ''}.
+      Approve it in Phantom to use it here.
+      <button class="pill primary small" data-connect>Connect</button>
     </div>`;
   }
   return '';
@@ -232,10 +249,6 @@ function welcome(): string {
       <div class="orb">${SHIELD}</div>
       <h1>Send safely.</h1>
       <p>Your transfer waits until the right wallet claims it.<br/>Wrong address? Just take it back.</p>
-      ${state.highlight && !state.notice && !state.pending ? `<div class="switch-hint">
-        <strong>Someone sent you a transfer</strong>
-        Connect the wallet it was sent to, then claim it.
-      </div>` : ''}
       ${walletNotice()}
       ${wallets.length ? `<div class="wallet-list">
         <div class="menu-label">Your wallets</div>
@@ -255,9 +268,7 @@ function tabs(): string {
 // A failed refresh: the data on screen may be old.
 const status = () => `<div id="status">${state.loadError
   ? `<div class="notice error status-error">Could not reach Solana Devnet${state.loaded ? ', balances may be out of date' : ''}. <button class="link-button" data-retry>Retry</button></div>`
-  : state.linkMissing
-    ? `<div class="notice info">The transfer in your link isn't waiting for this wallet: it was sent to another wallet, or already claimed or cancelled. <button class="link-button" data-dismiss-link>OK</button></div>`
-    : ''}</div>`;
+  : ''}</div>`;
 
 // The asset in the form, or SOL if that token is no longer in the wallet.
 const currentAsset = () => state.form.asset === 'SOL' || state.tokens.some((t) => t.mint.toBase58() === state.form.asset) ? state.form.asset : 'SOL';
@@ -396,7 +407,7 @@ async function checkRecipient(): Promise<void> {
   }
   showCheck('muted', 'Checking…');
   try {
-    const check = await checkRecipientFees(connection, recipient);
+    const check = await retry(() => checkRecipientFees(connection, recipient));
     if (token !== checkToken) return; // the address changed meanwhile
     state.fee = { recipient: text, check };
     showCheck(check.topUp ? 'warn' : 'ok', check.topUp
@@ -419,9 +430,6 @@ async function send(): Promise<void> {
   if (amount === null) return message('send-result', 'Enter a valid amount, like 0.5.', 'error');
   if (amount <= 0n) return message('send-result', 'Enter an amount greater than zero.', 'error');
   if (holding && amount > holding.amount) return message('send-result', 'You do not have that many tokens.', 'error');
-  if (state.loaded && !holding && amount + BigInt(check.topUp) > BigInt(state.sol)) {
-    return message('send-result', `Not enough SOL: you have ${sol(state.sol)} SOL${check.topUp ? `, and ${sol(check.topUp)} SOL goes to the recipient's claim fee` : ''}.`, 'error');
-  }
 
   const id = newTransferId();
   const tx = new Transaction();
@@ -495,7 +503,7 @@ async function act(kind: 'claim' | 'cancel', address: string): Promise<void> {
 function showTab(tab: Tab): void {
   state.tab = tab;
   render(); // right away, with the data already loaded
-  void refresh();
+  if (Date.now() - lastRefresh > TAB_REFRESH_MS) void refresh();
 }
 
 function toggleMenu(open: boolean): void {
@@ -526,7 +534,6 @@ function bind(root: ParentNode): void {
   self('[data-tab]', (el) => showTab(el.dataset.tab as Tab));
   on('[data-retry]', () => { state.loadError = false; paint(); void refresh(); });
   on('[data-recheck]', () => void checkRecipient());
-  on('[data-dismiss-link]', () => { state.linkMissing = false; replace('#status', status()); });
   on('[data-claim]', (el) => void act('claim', el.dataset.claim!));
   on('[data-cancel]', (el) => void act('cancel', el.dataset.cancel!));
   on('#send', () => void send());
@@ -566,7 +573,7 @@ function clearWallet(): void {
   checkToken++;
   Object.assign(state, {
     wallet: null, loaded: false, loadError: false, menu: false, tab: 'send', incoming: [], outgoing: [], tokens: [], sol: 0,
-    form: emptyForm(), fee: null, check: null, flash: null, highlightShown: false, linkMissing: false,
+    form: emptyForm(), fee: null, check: null, flash: null, highlightShown: false,
   });
 }
 
@@ -583,22 +590,22 @@ async function connectNew(): Promise<void> {
   if (connecting) return; // Phantom is already asking
   connecting = true;
   try {
-    const wallet = await connectWithSignature();
+    // First connection: a signature. Already connected: approving another account in Phantom is enough.
+    const wallet = connectedWallets().length ? await approveAccount() : await connectWithSignature();
     if (wallet) activate(wallet.toBase58());
   } finally {
     connecting = false;
   }
 }
 
-// Removes the active wallet from the connected list: selecting it again in Phantom will not reconnect it,
-// it needs a new signature. The other connected wallets stay available.
+// Disconnects Safe Send from Phantom (all accounts): it stays disconnected until "Connect Phantom" again.
 async function disconnectActive(): Promise<void> {
   if (!state.wallet) return;
-  const wallet = state.wallet;
+  const revoked = disconnectAll(); // forgets the wallets right away, before the page shows the welcome screen
   clearWallet();
   Object.assign(state, { pending: null, notice: null });
   render();
-  await disconnectWallet(wallet);
+  await revoked;
 }
 
 // Close the wallet menu when clicking anywhere else.
@@ -606,30 +613,39 @@ document.addEventListener('click', (event) => {
   if (state.menu && !(event.target as HTMLElement).closest('.wallet-wrap')) toggleMenu(false);
 });
 
-// Keep balances and transfers fresh while the page is open (e.g. a transfer arriving from someone else).
-setInterval(() => {
-  if (state.wallet && !state.busy && document.visibilityState === 'visible') void refresh();
-}, 30_000);
-document.addEventListener('visibilitychange', () => {
-  if (state.wallet && !state.busy && document.visibilityState === 'visible') void refresh();
-});
-
 // --- Start ---
 
-// The user selected another account in Phantom. Follow it only if it is one of the connected wallets; any other
-// account (including one the user disconnected) needs a new signature first.
-phantom()?.on('accountChanged', (key) => {
-  const account = key ? key.toString() : null;
-  if (account && connectedWallets().includes(account)) return activate(account);
-  clearWallet();
-  Object.assign(state, { pending: null, notice: { kind: 'not-connected', account } });
-  render();
+// The user selected another account in Phantom: Safe Send follows it. Phantom shares the address only if that
+// account already approved the site; for a new account, Phantom's connect popup opens to approve it.
+let approving = false;
+phantom()?.on('accountChanged', async (key) => {
+  if (connectedWallets().length === 0) return; // disconnected: wait for "Connect Phantom"
+  if (key) {
+    const account = key.toString();
+    rememberWallet(account);
+    return activate(account);
+  }
+  if (approving) return;
+  approving = true;
+  try {
+    const account = await approveAccount();
+    if (account) {
+      activate(account.toBase58());
+    } else {
+      clearWallet();
+      Object.assign(state, { pending: null, notice: { kind: 'not-connected', account: null } });
+      render();
+    }
+  } finally {
+    approving = false;
+  }
 });
 
 render();
-// Back on the page: resume only if the account selected in Phantom is one of the connected wallets.
+// Back on the page: resume with the account selected in Phantom, unless the user disconnected.
 void selectedAccount().then((selected) => {
-  const key = selected?.toBase58();
-  if (key && !state.wallet && connectedWallets().includes(key)) activate(key);
+  if (!selected || state.wallet || connectedWallets().length === 0) return;
+  rememberWallet(selected.toBase58());
+  activate(selected.toBase58());
 });
 
