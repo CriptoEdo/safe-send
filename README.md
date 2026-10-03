@@ -62,6 +62,10 @@ anchor build
 # end-to-end tests against a local validator
 solana-test-validator --reset --bpf-program EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg target/deploy/safe_send.so
 cd app && npm test
+# UI tests: the real app with a fake Phantom that signs with test keypairs, against the same local validator
+cd app && VITE_RPC_URL=http://127.0.0.1:8899 npx vite
+#   open http://localhost:5173/test/ui/harness.html, then in the browser console:
+#   await harness.setup(2); location.reload();   and after the reload:   await runSuite()
 # deploy to Devnet (needs ~2x the program size in rent, see `solana rent`)
 solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe_send-keypair.json --url devnet
 ```

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Safe Send UI harness</title>
+  </head>
+  <body>
+    <!--
+      Browser test harness (dev server only, not part of the build): the real app with a fake Phantom that signs
+      with test keypairs. Run the dev server against a local validator:
+        VITE_RPC_URL=http://127.0.0.1:8899 npx vite   →   http://localhost:5173/test/ui/harness.html
+      Test helpers are on window.harness (see fake-phantom.ts).
+    -->
+    <div id="app"></div>
+    <script type="module" src="./fake-phantom.ts"></script>
+    <script type="module" src="./suite.ts"></script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
