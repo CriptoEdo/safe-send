@@ -1,0 +1,24 @@
+{
+  "name": "safe-send-app",
+  "private": true,
+  "type": "module",
+  "description": "Safe Send web app: send SOL or tokens that wait for the recipient to verify them",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.7.1",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}

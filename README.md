@@ -1,0 +1,73 @@
+# Safe Send
+
+**Send crypto on Solana that only arrives when the right person verifies it.**
+
+A normal transfer to a mistyped address is lost forever. With Safe Send the funds are locked in an on-chain escrow until the recipient verifies the transfer from the wallet it was sent to. If nobody verifies it (wrong address, lost access, changed your mind), the sender cancels and gets everything back.
+
+- **Network:** Solana **Devnet**
+- **Program:** [`EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg`](https://explorer.solana.com/address/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg?cluster=devnet)
+- **Assets:** SOL and any SPL token (Token program)
+
+## How it works
+
+1. **Send.** The sender enters the recipient's address and an amount in the web app and signs with Phantom. The funds move into an escrow account (a PDA of the program) tied to that recipient.
+2. **Verify.** The recipient opens Safe Send with their Phantom wallet: the transfer is listed under *To verify*. Clicking **Verify & receive** signs a `claim` transaction; the program checks the signer is exactly the recipient and releases the funds.
+3. **Or cancel.** Until it is verified, the sender sees the transfer under *Sent, pending* and can **Cancel & refund** at any time.
+
+The rent of the escrow accounts always returns to the sender, on verify or cancel.
+
+### The recipient has no SOL for the fee
+
+Verifying is a transaction, so the recipient pays a network fee (5,000 lamports), and a Solana account must also keep a minimum balance (rent-exempt minimum, ~0.00089 SOL). Before sending, the app checks the recipient's SOL balance:
+
+- **enough SOL** (≥ rent-exempt minimum + 20,000 lamports of fee margin): nothing extra;
+- **not enough**: the sender's transaction also sends the difference to the recipient (~0.00091 SOL for an empty wallet), in the same transaction as the transfer. The app says so before you sign. This small top-up is a normal transfer, so it is not refundable if the address was wrong.
+
+For token transfers the recipient's token account is created by the sender at send time, so verifying never costs the recipient more than the fee.
+
+## Program
+
+`programs/safe_send/src/lib.rs` (Anchor 0.30.1):
+
+| Instruction | Signer | Effect |
+| --- | --- | --- |
+| `send_sol(id, amount)` | sender | locks `amount` lamports in the escrow PDA `["escrow", sender, id]` |
+| `claim_sol()` | recipient | lamports to the recipient, escrow rent to the sender |
+| `cancel_sol()` | sender | everything back to the sender |
+| `send_token(id, amount)` | sender | locks tokens in the vault PDA `["vault", escrow]` (the app creates the recipient's token account in the same transaction) |
+| `claim_token()` | recipient | tokens to the recipient, rent of escrow and vault to the sender |
+| `cancel_token()` | sender | tokens and rent back to the sender |
+
+Checks: only the recipient can claim (`NotRecipient`), only the sender can cancel, the asset must match (`WrongAsset`), no self-transfers (`SelfTransfer`), no zero amounts (`ZeroAmount`). The app also refuses program addresses as recipients (they cannot sign, so nobody could verify).
+
+## App
+
+`app/` is a static Vite + TypeScript site. `app/src/lib/safeSend.ts` builds the program's instructions and decodes escrows by hand (Anchor discriminators + Borsh layout), so it needs no IDL; `app/src/main.ts` is the UI.
+
+```bash
+cd app
+npm install
+npm run dev          # http://localhost:5173 (uses Devnet; VITE_RPC_URL to change the RPC)
+npm run build        # static files in app/dist, deployable on Vercel, Netlify or GitHub Pages
+```
+
+Phantom must be set to Devnet: Settings → Developer settings → Testnet mode → Solana Devnet.
+
+## Build, test, deploy
+
+The program builds in WSL/Linux with Solana CLI 2.0 and Anchor 0.30.1. Current crates need a newer Rust than Solana's toolchain, so `.cargo/config.toml` picks Rust 1.75-compatible versions and `Cargo.lock` pins `blake3`, `jobserver` and `proc-macro2`.
+
+```bash
+anchor build
+# end-to-end tests against a local validator
+solana-test-validator --reset --bpf-program EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg target/deploy/safe_send.so
+cd app && npm test
+# deploy to Devnet (needs ~2x the program size in rent, see `solana rent`)
+solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe_send-keypair.json --url devnet
+```
+
+## Limits
+
+- The top-up for the recipient's fee is not refundable if the address is wrong (it is ~0.0009 SOL). A relayer that pays the claim fee and gets reimbursed from the escrow would avoid it.
+- Token-2022 mints are not supported yet (only the classic Token program).
+- Transfers have no expiry: the sender cancels by hand.

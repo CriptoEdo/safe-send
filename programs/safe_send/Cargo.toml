@@ -1,0 +1,23 @@
+[package]
+name = "safe_send"
+version = "0.1.0"
+description = "Safe Send: transfers that wait for the recipient to verify them"
+edition = "2021"
+# The Solana SBF toolchain (platform-tools) is older than current crates: pick versions it can build.
+rust-version = "1.75"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "safe_send"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = "0.30.1"

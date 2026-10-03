@@ -1,0 +1,4 @@
+# Resolve dependencies to versions compatible with rust-version (see programs/safe_send/Cargo.toml),
+# instead of the newest ones, which need a newer Rust than Solana's toolchain.
+[resolver]
+incompatible-rust-versions = "fallback"

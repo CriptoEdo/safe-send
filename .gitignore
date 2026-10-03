@@ -1,0 +1,14 @@
+target/
+!target/idl/
+!target/types/
+node_modules/
+dist/
+.anchor/
+test-ledger/
+.secrets/
+*.log
+
+# Never commit Solana keypairs
+*keypair*.json
+id.json
+.env*
