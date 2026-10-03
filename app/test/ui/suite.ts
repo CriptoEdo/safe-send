@@ -29,7 +29,10 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     click('[data-connect]');
     await until(() => $('.wallet'), 'connected');
     check('connect asks one signature', h.controls.messages === 1, String(h.controls.messages));
-    await until(() => text('#balance').includes('2 SOL'), 'balance');
+    // Phantom repeating accountChanged for the same account while loading must not restart the load forever
+    for (let i = 0; i < 20; i++) { h.select(0); await wait(100); }
+    await until(() => text('#balance').includes('2 SOL'), 'balance despite repeated accountChanged', 10_000);
+    check('loads despite repeated accountChanged', true);
 
     // Tabs switch instantly, many times, stay where clicked, and do not flood the RPC
     await wait(1000);

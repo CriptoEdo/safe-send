@@ -9,7 +9,8 @@ import {
 import { approveAccount, connectWithSignature, connectedWallets, disconnectAll, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
 const RPC_URL = import.meta.env.VITE_RPC_URL ?? 'https://api.devnet.solana.com';
-const connection = new Connection(RPC_URL, 'confirmed');
+// Rate limits are retried below with a bounded number of attempts, not by web3.js's own open-ended backoff.
+const connection = new Connection(RPC_URL, { commitment: 'confirmed', disableRetryOnRateLimit: true });
 const app = document.getElementById('app')!;
 
 type Tab = 'send' | 'incoming' | 'sent';
@@ -98,11 +99,19 @@ function describeError(err: unknown): string {
 
 // --- Data ---
 
+// A request that does not answer in time counts as failed, so loading always ends.
+const REQUEST_TIMEOUT_MS = 6_000;
+function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = window.setTimeout(() => reject(new Error('Request timed out')), REQUEST_TIMEOUT_MS); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // The public Devnet RPC rejects bursts of requests: retry a failed call a couple of times before giving up.
 async function retry<T>(call: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await call();
+      return await withTimeout(call());
     } catch (err) {
       if (attempt >= 2) throw err;
       await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
@@ -115,11 +124,30 @@ let lastRefresh = 0;
 // Switching tabs reloads from the network at most this often; transactions and wallet changes always reload.
 const TAB_REFRESH_MS = 20_000;
 
-// Fetches balances and transfers of the active wallet in the background, then repaints. Results of an older
-// refresh, or of a wallet that is no longer active, are dropped.
-async function refresh(): Promise<void> {
+// One load at a time per wallet: asking again while it runs reuses it (Phantom can repeat accountChanged), and
+// `force` (after a transaction) runs one more load once it ends, so the new state is always fetched.
+let inFlight: { owner: string; promise: Promise<void> } | null = null;
+let reloadAfter = false;
+
+function refresh(force = false): Promise<void> {
   const owner = state.wallet;
-  if (!owner) return;
+  if (!owner) return Promise.resolve();
+  if (inFlight?.owner === owner.toBase58()) {
+    if (force) reloadAfter = true;
+    return inFlight.promise;
+  }
+  const promise: Promise<void> = load(owner).finally(() => {
+    if (inFlight?.promise !== promise) return;
+    inFlight = null;
+    if (reloadAfter) { reloadAfter = false; void refresh(); }
+  });
+  inFlight = { owner: owner.toBase58(), promise };
+  return promise;
+}
+
+// Fetches balances and transfers of `owner`, then repaints. Results for a wallet that is no longer active, or
+// of a load that was superseded, are dropped.
+async function load(owner: PublicKey): Promise<void> {
   const seq = ++refreshSeq;
   lastRefresh = Date.now();
   const current = () => seq === refreshSeq && state.wallet?.equals(owner);
@@ -465,7 +493,7 @@ async function send(): Promise<void> {
       ? `It's one of your wallets: <button class="link-button" data-use="${recipient.toBase58()}">switch to ${short(recipient)} to claim it</button>`
       : `Sent to another of your wallets? <button class="link-button" data-add>Connect it to claim</button>`}</div>` };
   if (state.tab === 'send') render();
-  void refresh(); // new balance and pending count
+  void refresh(true); // new balance and pending count
 }
 
 async function act(kind: 'claim' | 'cancel', address: string): Promise<void> {
@@ -491,7 +519,7 @@ async function act(kind: 'claim' | 'cancel', address: string): Promise<void> {
     state.flash = { tab, target: 'list-result', kind: 'ok', html: `${kind === 'claim' ? `<strong>Claimed.</strong> ${amountLabel(t)} received.` : `<strong>Cancelled.</strong> ${amountLabel(t)} is back in your wallet.`}
       <a href="${explorer('tx', signature)}" target="_blank" rel="noopener">View transaction ↗</a>` };
     render();
-    void refresh();
+    void refresh(true);
   } catch (err) {
     state.busy = false;
     if (!state.wallet?.equals(me)) return;
@@ -532,7 +560,7 @@ function bind(root: ParentNode): void {
   on('[data-disconnect]', () => void disconnectActive());
   on('[data-tab]', (el) => showTab(el.dataset.tab as Tab));
   self('[data-tab]', (el) => showTab(el.dataset.tab as Tab));
-  on('[data-retry]', () => { state.loadError = false; paint(); void refresh(); });
+  on('[data-retry]', () => { state.loadError = false; paint(); void refresh(true); });
   on('[data-recheck]', () => void checkRecipient());
   on('[data-claim]', (el) => void act('claim', el.dataset.claim!));
   on('[data-cancel]', (el) => void act('cancel', el.dataset.cancel!));
@@ -569,7 +597,9 @@ function activate(wallet: string): void {
 }
 
 function clearWallet(): void {
-  refreshSeq++; // drop refreshes still running for the previous wallet
+  refreshSeq++; // drop loads still running for the previous wallet
+  inFlight = null;
+  reloadAfter = false;
   checkToken++;
   Object.assign(state, {
     wallet: null, loaded: false, loadError: false, menu: false, tab: 'send', incoming: [], outgoing: [], tokens: [], sol: 0,
