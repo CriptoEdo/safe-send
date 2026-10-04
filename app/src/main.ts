@@ -862,15 +862,16 @@ async function followSelected(): Promise<void> {
 window.addEventListener('focus', () => void followSelected());
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void followSelected(); });
 
-// While the page is visible, keep watching Phantom so a switch made in its side panel shows up within a second,
-// without a click. Both checks talk only to the extension (no RPC): every 0.5 s the account Phantom exposes on
-// the page, and every 1.5 s, in case that is not updated, the account it has selected.
+// accountChanged is the instant path, but Phantom's side panel does not send it. While the page is visible the
+// app also watches Phantom itself, talking only to the extension (no RPC): every 0.1 s it reads the account
+// Phantom exposes on the page (an in-memory property, negligible cost), and every 1 s, in case that property is
+// not updated, it asks Phantom which account is selected (a message to the extension, so not more often).
 const watching = () => document.visibilityState === 'visible' && !!state.wallet;
 setInterval(() => {
   const exposed = phantom()?.publicKey?.toString();
   if (watching() && exposed && exposed !== state.wallet?.toBase58()) void followSelected();
-}, 500);
-setInterval(() => { if (watching()) void followSelected(); }, 1_500);
+}, 100);
+setInterval(() => { if (watching()) void followSelected(); }, 1_000);
 
 render();
 // Back on the page: resume with the account selected in Phantom, unless the user disconnected.

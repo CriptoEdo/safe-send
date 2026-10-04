@@ -224,7 +224,7 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     const switchedAt = Date.now();
     h.select(1);
     await until(() => text('.top').includes(B.slice(0, 4)), 'B followed without an event', 3_000);
-    check('switch noticed without an event or a click', Date.now() - switchedAt < 2_000, `${Date.now() - switchedAt} ms`);
+    check('switch noticed without an event or a click', Date.now() - switchedAt < 1_000, `${Date.now() - switchedAt} ms`);
     h.select(cIndex);
     await until(() => text('.top').includes(C.slice(0, 4)), 'C followed without an event', 3_000);
     h.select(1);
