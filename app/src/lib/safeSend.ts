@@ -4,7 +4,7 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID, ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, getExtensionTypes,
-  getTransferFeeConfig, getTransferHook, unpackMint,
+  getAccountLen, getAccountLenForMint, getAccountTypeOfMintType, getTransferFeeConfig, getTransferHook, unpackMint,
 } from '@solana/spl-token';
 import { sha256 } from '@noble/hashes/sha256';
 
@@ -141,6 +141,10 @@ export interface MintInfo {
   transferHook: boolean;
   // The issuer can move tokens out of any account, including the escrow.
   permanentDelegate: boolean;
+  // Sizes (bytes) of a token account for this mint: the vault, and an associated token account (Token-2022 adds
+  // the immutable-owner extension to those). They set the deposits the sender pays.
+  vaultSize: number;
+  ataSize: number;
 }
 
 export async function mintInfos(connection: Connection, mints: PublicKey[]): Promise<Map<string, MintInfo>> {
@@ -168,6 +172,10 @@ export async function mintInfos(connection: Connection, mints: PublicKey[]): Pro
           ? { basisPoints: feeConfig.transferFeeBasisPoints, maximum: feeConfig.maximumFee } : null,
         transferHook: !!hook && (!hook.programId.equals(PublicKey.default) || !hook.authority.equals(PublicKey.default)),
         permanentDelegate: extensions.includes(ExtensionType.PermanentDelegate),
+        vaultSize: getAccountLenForMint(state),
+        ataSize: tokenProgram.equals(TOKEN_2022_PROGRAM_ID)
+          ? getAccountLen([...extensions.map(getAccountTypeOfMintType).filter((e) => e !== ExtensionType.Uninitialized), ExtensionType.ImmutableOwner])
+          : getAccountLenForMint(state),
       });
     });
   }

@@ -1,13 +1,13 @@
 import './polyfills.ts';
 import './style.css';
 import { Connection, PublicKey, SendTransactionError, Transaction } from '@solana/web3.js';
-import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
   fetchConfig, mintInfos, newTransferId, outgoingTransfers, percentFee, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
   type FeeCheck, type FeeConfig, type MintInfo, type PendingTransfer,
 } from './lib/safeSend.ts';
-import { MAX_PRIORITY_LAMPORTS, claimPriorityCap, computeBudget } from './lib/fees.ts';
+import { BASE_FEE_LAMPORTS, MAX_PRIORITY_LAMPORTS, cappedPrice, claimPriorityCap, computeBudget, recentPrice } from './lib/fees.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
 import { IS_MAINNET, NETWORK_NAME, RPC_URL, explorer } from './network.ts';
@@ -73,6 +73,8 @@ function parseUnits(text: string, decimals: number): bigint | null {
 }
 
 const sol = (lamports: number | bigint) => units(BigInt(lamports), 9);
+// SOL rounded up to 6 decimals, for estimates shown before signing.
+const solUp = (lamports: number) => sol(Math.ceil(lamports / 1_000) * 1_000);
 
 // Mints (token program, decimals, Token-2022 extensions), loaded with the wallet's data so rendering never
 // waits for the network.
@@ -335,6 +337,84 @@ function tokenNote(asset: string): string {
   return notes.join(' ');
 }
 
+// --- Cost before signing ---
+
+// Rent deposits by account size, and which token accounts exist (recipient's, treasury's), cached.
+const rentCache = new Map<number, number>();
+const accountExists = new Map<string, boolean>();
+const rentFor = async (bytes: number) => {
+  if (!rentCache.has(bytes)) rentCache.set(bytes, await retry(() => connection.getMinimumBalanceForRentExemption(bytes)));
+  return rentCache.get(bytes)!;
+};
+async function exists(address: PublicKey): Promise<boolean> {
+  const key = address.toBase58();
+  if (!accountExists.has(key)) accountExists.set(key, !!(await retry(() => connection.getAccountInfo(address))));
+  return accountExists.get(key)!;
+}
+
+// Recent priority fees on the accounts a send writes (sender and treasury), refreshed at most every 20 s.
+let feesCache: { key: string; at: number; price: number } | null = null;
+async function priorityPrice(writable: PublicKey[]): Promise<number> {
+  const key = writable.map((k) => k.toBase58()).join();
+  if (!feesCache || feesCache.key !== key || Date.now() - feesCache.at > 20_000) {
+    const fees = await retry(() => connection.getRecentPrioritizationFees({ lockedWritableAccounts: writable }));
+    feesCache = { key, at: Date.now(), price: recentPrice(fees) };
+  }
+  return feesCache.price;
+}
+
+// Compute units a send typically uses (measured on the program, with margin): the exact amount is measured
+// when sending, so the network fee shown before is an estimate.
+const SOL_SEND_UNITS = 20_000;
+const TOKEN_SEND_UNITS = 60_000;
+const ATA_CREATE_UNITS = 25_000;
+
+let costToken = 0;
+
+// What the sender pays for the transfer in the form: the amount and Safe Send's fee, plus the SOL deposits for
+// the accounts the transfer opens (returned on claim or cancel), the token accounts it creates for the recipient
+// or the treasury (not returned), the recipient's claim-fee top-up, and the network fee.
+async function updateCost(): Promise<void> {
+  const out = document.getElementById('cost-note');
+  const token = ++costToken;
+  const show = (html: string) => { if (token === costToken && out) out.innerHTML = html; };
+  const config = state.config;
+  const fee = state.fee;
+  const asset = currentAsset();
+  const holding = asset === 'SOL' ? null : state.tokens.find((t) => t.mint.toBase58() === asset);
+  const mint = holding ? mintCache.get(asset) : null;
+  const amount = parseUnits(state.form.amount, holding ? holding.decimals : 9);
+  if (!config || !fee || fee.recipient !== state.form.recipient.trim() || !amount || amount <= 0n || (holding && !mint)) return show('');
+  try {
+    const recipient = new PublicKey(fee.recipient);
+    const percent = percentFee(config, amount);
+    const ESCROW_BYTES = 194;
+    let deposit = await rentFor(ESCROW_BYTES);
+    let accounts = 0; // token accounts created for others, paid by the sender
+    if (mint) {
+      deposit += await rentFor(mint.vaultSize);
+      const ata = (owner: PublicKey) => getAssociatedTokenAddressSync(mint.mint, owner, true, mint.tokenProgram);
+      if (!(await exists(ata(recipient)))) accounts += await rentFor(mint.ataSize);
+      if (percent > 0n && !(await exists(ata(config.treasury)))) accounts += await rentFor(mint.ataSize);
+    }
+    const flat = Number(config.flatFeeLamports);
+    // Network fee: signature fee + priority fee at the current price, within the same cap as when sending
+    const computeUnits = mint ? TOKEN_SEND_UNITS + ATA_CREATE_UNITS * (percent > 0n ? 2 : 1) : SOL_SEND_UNITS;
+    const price = cappedPrice(await priorityPrice([state.wallet!, config.treasury]), computeUnits, MAX_PRIORITY_LAMPORTS);
+    const networkFee = BASE_FEE_LAMPORTS + Math.ceil((computeUnits * price) / 1_000_000);
+    const solTotal = (mint ? 0 : Number(amount + percent)) + flat + deposit + accounts + fee.check.topUp + networkFee;
+    const unit = holding ? short(holding.mint) : 'SOL';
+    const parts = [`<strong>${mint ? `${units(amount + percent, holding!.decimals)} ${unit} + ` : ''}${solUp(solTotal)} SOL</strong>`];
+    const details = [`${solUp(deposit)} SOL is a deposit you get back on claim or cancel`];
+    if (accounts) details.push(`${solUp(accounts)} SOL opens a token account for ${percent > 0n ? 'the recipient or the fee' : 'the recipient'}`);
+    if (fee.check.topUp) details.push(`${solUp(fee.check.topUp)} SOL covers the recipient's claim fee`);
+    details.push(`about ${solUp(networkFee)} SOL is the network fee`);
+    show(`You pay about ${parts.join('')}. <span class="muted">${details.join('; ')}.</span>`);
+  } catch {
+    show('');
+  }
+}
+
 // Safe Send's fee for sending `state.form.amount` of `asset`, paid on top (empty while there are no fees).
 function feeNote(asset: string): string {
   const config = state.config;
@@ -374,6 +454,7 @@ function sendView(): string {
         <input id="recipient" autocomplete="off" spellcheck="false" placeholder="Recipient wallet address" value="${escape(state.form.recipient)}" />
       </label>
       <p id="recipient-check" class="check ${state.check?.cls ?? ''}">${state.check?.html ?? ''}</p>
+      <p id="cost-note" class="cost-note"></p>
       <button id="send" class="pill primary big" ${canSend() ? '' : 'disabled'}>Safe Send</button>
       <div id="send-result"></div>
       <details class="how">
@@ -433,6 +514,7 @@ function render(): void {
   } else {
     const body = state.tab === 'send' ? sendView() : listView(state.tab);
     app.innerHTML = `<div class="shell">${header()}${walletNotice()}<div class="card">${tabs()}${status()}${body}</div></div>`;
+    if (state.tab === 'send') void updateCost();
     const flash = state.flash?.tab === state.tab && document.getElementById(state.flash.target);
     if (flash) flash.innerHTML = `<div class="notice ${state.flash!.kind}">${state.flash!.html}</div>`;
   }
@@ -452,6 +534,7 @@ function message(target: Flash['target'], html: string, kind: Flash['kind'] = 'i
 function updateSendButton(): void {
   const button = document.getElementById('send') as HTMLButtonElement | null;
   if (button) button.disabled = !canSend();
+  void updateCost(); // the recipient check changed
 }
 
 function showCheck(cls: string, html: string): void {
@@ -540,6 +623,7 @@ async function send(): Promise<void> {
   const link = `${location.origin}${location.pathname}?transfer=${escrowAddress(sender, id).toBase58()}`;
   const own = connectedWallets().includes(recipient.toBase58());
   Object.assign(state, { form: emptyForm(asset), fee: null, check: null });
+  accountExists.clear(); // the send may have created token accounts
   state.flash = { tab: 'send', target: 'send-result', kind: 'ok', html: `
     <strong>Locked and on its way.</strong> It arrives when the recipient claims it.
     ${check.topUp ? `<br/>Included ${sol(check.topUp)} SOL so they can pay the claim fee.` : ''}
@@ -630,12 +714,14 @@ function bind(root: ParentNode): void {
   on('#amount', (el) => {
     state.form.amount = (el as HTMLInputElement).value;
     document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
+    void updateCost();
   }, 'input');
   on('#asset', (el) => {
     state.form.asset = (el as HTMLSelectElement).value;
     document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
     document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
     document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
+    void updateCost();
   }, 'change');
   on('#recipient', (el) => {
     state.form.recipient = (el as HTMLInputElement).value;

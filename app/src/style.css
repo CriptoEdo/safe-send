@@ -103,6 +103,9 @@ a:hover { text-decoration: underline; }
 .token-note:empty { display: none; }
 .fee-note { margin: 8px 4px 0; font-size: 13px; color: var(--muted); }
 .fee-note:empty { display: none; }
+.cost-note { margin: 4px 4px 12px; font-size: 13px; color: var(--fg); }
+.cost-note:empty { display: none; }
+.cost-note .muted { color: var(--muted); }
 .token-note .error { color: var(--error); }
 
 .field { display: flex; align-items: center; gap: 12px; padding: 4px 6px 4px 18px; background: var(--field); border-radius: 18px; }
