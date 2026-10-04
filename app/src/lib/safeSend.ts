@@ -220,13 +220,13 @@ export const outgoingTransfers = (connection: Connection, wallet: PublicKey) => 
 
 // Lamports the recipient needs to verify, on top of the minimum balance a Solana account must keep
 // (rent-exempt minimum): the fee payer has to stay above that minimum *after* paying the fee, before the claim
-// even runs. The claim sets its own small priority fee (claimFeeIxs), so it costs ~5,100 lamports; the rest
-// is margin.
+// even runs. It covers the signature fee plus the claim's priority fee, which the app keeps within
+// MAX_CLAIM_PRIORITY_LAMPORTS (fees.ts) however busy the network is.
 export const CLAIM_FEE_LAMPORTS = 100_000;
 
-// Compute budget for claim and cancel transactions. Wallets like Phantom add their own priority fee when a
-// transaction sets none (0.00008 SOL seen on Devnet), which a recipient funded only with the top-up cannot
-// pay. Setting it here keeps the fee predictable: 100,000 CU × 1,000 micro-lamports = 100 lamports + 5,000 base.
+// A fixed, small compute budget (100,000 CU × 1,000 micro-lamports = 100 lamports + 5,000 base), for scripts
+// and tests. The app computes the budget per transaction instead (fees.ts). Either way the transaction sets
+// one: wallets like Phantom add their own priority fee only when it does not (0.00008 SOL seen on Devnet).
 export const claimFeeIxs = () => [
   ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
   ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000 }),

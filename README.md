@@ -79,5 +79,6 @@ solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe
 ## Limits
 
 - The top-up for the recipient's fee is not refundable if the address is wrong (it is ~0.0009 SOL). A relayer that pays the claim fee and gets reimbursed from the escrow would avoid it.
+- Fees: every transaction sets its own compute budget (`app/src/lib/fees.ts`): units measured by simulating it (+15%), price from `getRecentPrioritizationFees` on the accounts it writes (75th percentile, at least 1,000 micro-lamports). The priority fee is capped at 0.001 SOL for senders, and for claims at what the recipient can pay above the rent-exempt minimum (≤ 90,000 lamports, within the top-up). The simulation also catches failing transactions before the wallet opens.
 - Token-2022: transfer-fee tokens are supported (the escrow records what reached the vault; the fee withheld in the vault is harvested to the mint so it can close, which needs the mint writable in claim/cancel). Tokens with a transfer hook are refused at send time, since a hook (even one set later) could block the release. With a permanent delegate the issuer can move tokens out of the vault; the release moves whatever is left. Tokens that cannot be deposited (non-transferable, frozen by default) fail the send as a whole.
 - Transfers have no expiry: the sender cancels by hand.

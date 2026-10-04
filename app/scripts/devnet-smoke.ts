@@ -2,15 +2,24 @@
 // recipient verifies; then send and cancel. The sender is a funded keypair file (e.g. the deployer).
 //   node scripts/devnet-smoke.ts <path/to/sender-keypair.json>
 import { readFileSync } from 'node:fs';
-import { Connection, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction, type TransactionInstruction } from '@solana/web3.js';
+import { claimPriorityCap, computeBudget } from '../src/lib/fees.ts';
 import {
   ESCROW_SIZE, cancelSolIx, checkRecipientFees, decodeEscrow, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx,
 } from '../src/lib/safeSend.ts';
 
 const connection = new Connection(process.env.RPC_URL ?? 'https://api.devnet.solana.com', 'confirmed');
 const sender = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.argv[2], 'utf8'))));
-const run = (signer: Keypair, ...ixs: Parameters<Transaction['add']>) =>
-  sendAndConfirmTransaction(connection, new Transaction().add(...ixs), [signer], { commitment: 'confirmed' });
+// Like the app: compute budget measured by simulation, priority fee from recent fees (capped for claims)
+async function run(signer: Keypair, ...ixs: TransactionInstruction[]) {
+  const cap = ixs.some((ix) => ix.data.subarray(0, 8).equals(Buffer.from(claimSolIx({ recipient: signer.publicKey, sender: signer.publicKey, escrow: signer.publicKey }).data.subarray(0, 8))))
+    ? await claimPriorityCap(connection, signer.publicKey) : undefined;
+  const budget = await computeBudget(connection, ixs, signer.publicKey, cap);
+  const signature = await sendAndConfirmTransaction(connection, new Transaction().add(...budget.instructions, ...ixs), [signer], { commitment: 'confirmed' });
+  const meta = (await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }))!.meta!;
+  console.log(`  budget ${budget.units} CU (used ${meta.computeUnitsConsumed}) × ${budget.microLamports} µlamports, fee ${meta.fee} lamports${cap !== undefined ? `, claim cap ${cap}` : ''}`);
+  return signature;
+}
 const tx = (sig: string) => `https://explorer.solana.com/tx/${sig}?cluster=devnet`;
 
 const recipient = Keypair.generate();

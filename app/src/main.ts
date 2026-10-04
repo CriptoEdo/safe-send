@@ -3,10 +3,11 @@ import './style.css';
 import { Connection, PublicKey, SendTransactionError, Transaction } from '@solana/web3.js';
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import {
-  cancelSolIx, cancelTokenIx, checkRecipientFees, claimFeeIxs, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
+  cancelSolIx, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
   mintInfos, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
   type FeeCheck, type MintInfo, type PendingTransfer,
 } from './lib/safeSend.ts';
+import { MAX_PRIORITY_LAMPORTS, claimPriorityCap, computeBudget } from './lib/fees.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
 // Helius Devnet RPC from Vercel (public by design: VITE_ variables end up in the page; the key is restricted to
@@ -499,9 +500,12 @@ async function send(): Promise<void> {
 
   state.busy = true;
   updateSendButton();
-  message('send-result', 'Confirm in Phantom…');
+  message('send-result', 'Preparing the transaction…');
   let signature: string;
   try {
+    // Units measured by simulation and the current priority fee (also catches errors before Phantom opens)
+    tx.instructions.unshift(...(await computeBudget(connection, tx.instructions, sender)).instructions);
+    message('send-result', 'Confirm in Phantom…');
     signature = await signAndSend(connection, tx, sender);
   } catch (err) {
     state.busy = false;
@@ -536,14 +540,18 @@ async function act(kind: 'claim' | 'cancel', address: string): Promise<void> {
   const me = state.wallet;
   const mint = t.isSol ? null : mintCache.get(t.mint.toBase58());
   if (!t.isSol && !mint) return; // loaded with the transfers
-  const tx = new Transaction().add(...claimFeeIxs(), kind === 'claim'
+  const tx = new Transaction().add(kind === 'claim'
     ? (mint ? claimTokenIx({ recipient: me, sender: t.sender, mint, escrow: t.address }) : claimSolIx({ recipient: me, sender: t.sender, escrow: t.address }))
     : (mint ? cancelTokenIx({ sender: me, mint, escrow: t.address }) : cancelSolIx({ sender: me, escrow: t.address })));
   state.busy = true;
   const tab = state.tab;
-  state.flash = { tab, target: 'list-result', kind: 'info', html: 'Confirm in Phantom…' };
+  state.flash = { tab, target: 'list-result', kind: 'info', html: 'Preparing the transaction…' };
   render(); // buttons disabled while waiting
   try {
+    // A claim's priority fee stays within what the recipient can pay (e.g. only the sender's top-up)
+    const cap = kind === 'claim' ? await claimPriorityCap(connection, me) : MAX_PRIORITY_LAMPORTS;
+    tx.instructions.unshift(...(await computeBudget(connection, tx.instructions, me, cap)).instructions);
+    message('list-result', 'Confirm in Phantom…');
     const signature = await signAndSend(connection, tx, me);
     state.busy = false;
     closed.add(address);
