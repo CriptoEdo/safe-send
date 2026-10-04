@@ -1,8 +1,8 @@
-// Smoke test of the deployed program on Devnet: send with fee top-up to a brand-new wallet (0 SOL), the
+// Smoke test of the deployed program (Devnet by default, Mainnet with RPC_URL): send with fee top-up to a brand-new wallet (0 SOL), the
 // recipient verifies; then send and cancel. The sender is a funded keypair file (e.g. the deployer).
 //   node scripts/devnet-smoke.ts <path/to/sender-keypair.json>
 import { readFileSync } from 'node:fs';
-import { Connection, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction, type TransactionInstruction } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, SystemProgram, Transaction, sendAndConfirmTransaction, type TransactionInstruction } from '@solana/web3.js';
 import { claimPriorityCap, computeBudget } from '../src/lib/fees.ts';
 import {
   ESCROW_SIZE, cancelSolIx, checkRecipientFees, decodeEscrow, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx, fetchConfig
@@ -21,7 +21,8 @@ async function run(signer: Keypair, ...ixs: TransactionInstruction[]) {
   console.log(`  budget ${budget.units} CU (used ${meta.computeUnitsConsumed}) × ${budget.microLamports} µlamports, fee ${meta.fee} lamports${cap !== undefined ? `, claim cap ${cap}` : ''}`);
   return signature;
 }
-const tx = (sig: string) => `https://explorer.solana.com/tx/${sig}?cluster=devnet`;
+const cluster = /mainnet/.test(connection.rpcEndpoint) ? '' : '?cluster=devnet';
+const tx = (sig: string) => `https://explorer.solana.com/tx/${sig}${cluster}`;
 
 const recipient = Keypair.generate();
 const check = await checkRecipientFees(connection, recipient.publicKey);
@@ -39,6 +40,12 @@ console.log(`escrow layout: ${escrowInfo.data.length} bytes, version ${layout.ve
 
 const claimed = await run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) }));
 console.log('verified by the recipient:', tx(claimed), `→ recipient now ${await connection.getBalance(recipient.publicKey)} lamports`);
+// Send the test recipient's SOL back to the sender (its key only exists in this script)
+const leftover = await connection.getBalance(recipient.publicKey);
+const swept = await sendAndConfirmTransaction(connection, new Transaction().add(SystemProgram.transfer({
+  fromPubkey: recipient.publicKey, toPubkey: sender.publicKey, lamports: leftover - 5_000,
+})), [recipient], { commitment: 'confirmed' });
+console.log(`returned ${leftover - 5_000} lamports to the sender:`, tx(swept));
 
 const id2 = newTransferId();
 const sent2 = await run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: id2, lamports: amount }));
