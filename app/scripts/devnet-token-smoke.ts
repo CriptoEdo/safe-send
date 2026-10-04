@@ -9,10 +9,11 @@ import {
   getAccount, getAssociatedTokenAddressSync, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
 } from '@solana/spl-token';
 import {
-  cancelTokenIx, claimFeeIxs, claimTokenIx, escrowAddress, mintInfos, newTransferId, outgoingTransfers, sendTokenIxs, vaultAddress,
+  cancelTokenIx, claimFeeIxs, claimTokenIx, escrowAddress, mintInfos, newTransferId, outgoingTransfers, sendTokenIxs, vaultAddress, fetchConfig
 } from '../src/lib/safeSend.ts';
 
 const connection = new Connection(process.env.RPC_URL ?? 'https://api.devnet.solana.com', 'confirmed');
+const config = await fetchConfig(connection); // the fee configuration (fees, treasury)
 const sender = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.argv[2], 'utf8'))));
 const run = (signers: Keypair[], ...ixs: Parameters<Transaction['add']>) =>
   sendAndConfirmTransaction(connection, new Transaction().add(...ixs), signers, { commitment: 'confirmed' });
@@ -39,7 +40,7 @@ const recipient = Keypair.generate();
 await run([sender], SystemProgram.transfer({ fromPubkey: sender.publicKey, toPubkey: recipient.publicKey, lamports: 0.01 * LAMPORTS_PER_SOL }));
 const id = newTransferId();
 const escrow = escrowAddress(sender.publicKey, id);
-console.log('sent:', tx(await run([sender], ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint, senderToken, id, amount: 10_000_000n }))));
+console.log('sent:', tx(await run([sender], ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint, senderToken, id, amount: 10_000_000n }))));
 check((await outgoingTransfers(connection, sender.publicKey)).find((t) => t.address.equals(escrow))?.amount === 9_900_000n, 'escrow records 9.9 (10 minus the 1% fee)');
 console.log('claimed:', tx(await run([recipient], ...claimFeeIxs(), claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint, escrow }))));
 const received = await getAccount(connection, getAssociatedTokenAddressSync(mint.mint, recipient.publicKey, true, TOKEN_2022_PROGRAM_ID), 'confirmed', TOKEN_2022_PROGRAM_ID);
@@ -50,7 +51,7 @@ check(await connection.getAccountInfo(vaultAddress(escrow)) === null && await co
 const id2 = newTransferId();
 const escrow2 = escrowAddress(sender.publicKey, id2);
 const before = (await getAccount(connection, senderToken, 'confirmed', TOKEN_2022_PROGRAM_ID)).amount;
-await run([sender], ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint, senderToken, id: id2, amount: 5_000_000n }));
+await run([sender], ...sendTokenIxs({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint, senderToken, id: id2, amount: 5_000_000n }));
 console.log('cancelled:', tx(await run([sender], cancelTokenIx({ sender: sender.publicKey, mint, escrow: escrow2 }))));
 const after = (await getAccount(connection, senderToken, 'confirmed', TOKEN_2022_PROGRAM_ID)).amount;
 check(before - after === 5_000_000n - 4_950_000n + 49_500n, 'cancel returned 4.9005 (two 1% fees)');

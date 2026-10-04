@@ -4,8 +4,8 @@ import { Connection, PublicKey, SendTransactionError, Transaction } from '@solan
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
-  mintInfos, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
-  type FeeCheck, type MintInfo, type PendingTransfer,
+  fetchConfig, mintInfos, newTransferId, outgoingTransfers, percentFee, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
+  type FeeCheck, type FeeConfig, type MintInfo, type PendingTransfer,
 } from './lib/safeSend.ts';
 import { MAX_PRIORITY_LAMPORTS, claimPriorityCap, computeBudget } from './lib/fees.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
@@ -29,6 +29,7 @@ const state = {
   loadError: false, // the last refresh failed
   sol: 0,
   tokens: [] as TokenHolding[],
+  config: null as FeeConfig | null, // Safe Send's fees and treasury
   incoming: [] as PendingTransfer[],
   outgoing: [] as PendingTransfer[],
   tab: 'send' as Tab,
@@ -158,12 +159,13 @@ async function load(owner: PublicKey): Promise<void> {
   lastRefresh = Date.now();
   const current = () => seq === refreshSeq && state.wallet?.equals(owner);
   try {
-    const [lamports, classic, token2022, incoming, outgoing] = await Promise.all([
+    const [lamports, classic, token2022, incoming, outgoing, config] = await Promise.all([
       retry(() => connection.getBalance(owner)),
       retry(() => connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID })),
       retry(() => connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID })),
       retry(() => incomingTransfers(connection, owner)),
       retry(() => outgoingTransfers(connection, owner)),
+      retry(() => fetchConfig(connection)),
     ]);
     // One entry per mint (the account with the most tokens, if the wallet has several).
     const holdings = new Map<string, TokenHolding>();
@@ -182,6 +184,7 @@ async function load(owner: PublicKey): Promise<void> {
       loadError: false,
       sol: lamports,
       tokens,
+      config,
       incoming: incoming.filter(open).sort((a, b) => b.createdAt - a.createdAt),
       outgoing: outgoing.filter(open).sort((a, b) => b.createdAt - a.createdAt),
     });
@@ -212,6 +215,7 @@ function paint(): void {
   }
   document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
   document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
+  document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
 }
 
 // Replaces one element with fresh HTML and binds the new element's buttons.
@@ -334,6 +338,20 @@ function tokenNote(asset: string): string {
   return notes.join(' ');
 }
 
+// Safe Send's fee for sending `state.form.amount` of `asset`, paid on top (empty while there are no fees).
+function feeNote(asset: string): string {
+  const config = state.config;
+  if (!config || (config.feeBps === 0 && config.flatFeeLamports === 0n)) return '';
+  const holding = asset === 'SOL' ? null : state.tokens.find((t) => t.mint.toBase58() === asset);
+  const decimals = holding ? holding.decimals : 9;
+  const unit = holding ? short(holding.mint) : 'SOL';
+  const amount = parseUnits(state.form.amount, decimals) ?? 0n;
+  const parts: string[] = [];
+  if (config.feeBps > 0) parts.push(`${units(percentFee(config, amount), decimals)} ${unit} (${config.feeBps / 100}%)`);
+  if (config.flatFeeLamports > 0n) parts.push(`${sol(config.flatFeeLamports)} SOL`);
+  return `Safe Send fee, paid on top: ${parts.join(' + ')}`;
+}
+
 const balanceLabel = (asset: string) => {
   if (!state.loaded) return 'Balance …';
   if (asset === 'SOL') return `Balance ${sol(state.sol)} SOL`;
@@ -354,6 +372,7 @@ function sendView(): string {
         <div id="balance" class="balance">${balanceLabel(state.form.asset)}</div>
       </div>
       <p id="token-note" class="token-note">${tokenNote(state.form.asset)}</p>
+      <p id="fee-note" class="fee-note">${feeNote(state.form.asset)}</p>
       <label class="field"><span>To</span>
         <input id="recipient" autocomplete="off" spellcheck="false" placeholder="Recipient wallet address" value="${escape(state.form.recipient)}" />
       </label>
@@ -482,6 +501,8 @@ async function send(): Promise<void> {
   const { check } = state.fee!;
   const recipient = new PublicKey(state.fee!.recipient);
   const asset = currentAsset();
+  const config = state.config;
+  if (!config) return message('send-result', 'Still loading: try again in a moment.', 'error');
   const holding = asset === 'SOL' ? null : state.tokens.find((t) => t.mint.toBase58() === asset)!;
   const mint = holding && mintCache.get(asset);
   if (holding && !mint) return message('send-result', 'Token details are still loading: try again in a moment.', 'error');
@@ -489,14 +510,16 @@ async function send(): Promise<void> {
   const amount = parseUnits(state.form.amount, holding ? holding.decimals : 9);
   if (amount === null) return message('send-result', 'Enter a valid amount, like 0.5.', 'error');
   if (amount <= 0n) return message('send-result', 'Enter an amount greater than zero.', 'error');
-  if (holding && amount > holding.amount) return message('send-result', 'You do not have that many tokens.', 'error');
+  if (holding && amount + percentFee(config, amount) > holding.amount) {
+    return message('send-result', `You do not have that many tokens${config.feeBps ? ' (including the fee)' : ''}.`, 'error');
+  }
   if (mint && transferFeeOf(mint, amount) >= amount) return message('send-result', "The token's transfer fee would take the whole amount: send more.", 'error');
 
   const id = newTransferId();
   const tx = new Transaction();
   if (check.topUp) tx.add(topUpIx(sender, recipient, check.topUp));
-  if (holding && mint) tx.add(...sendTokenIxs({ sender, recipient, mint, senderToken: holding.account, id, amount }));
-  else tx.add(sendSolIx({ sender, recipient, id, lamports: amount }));
+  if (holding && mint) tx.add(...sendTokenIxs({ sender, recipient, mint, senderToken: holding.account, id, amount, config }));
+  else tx.add(sendSolIx({ sender, recipient, id, lamports: amount, config }));
 
   state.busy = true;
   updateSendButton();
@@ -607,11 +630,15 @@ function bind(root: ParentNode): void {
   on('[data-claim]', (el) => void act('claim', el.dataset.claim!));
   on('[data-cancel]', (el) => void act('cancel', el.dataset.cancel!));
   on('#send', () => void send());
-  on('#amount', (el) => { state.form.amount = (el as HTMLInputElement).value; }, 'input');
+  on('#amount', (el) => {
+    state.form.amount = (el as HTMLInputElement).value;
+    document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
+  }, 'input');
   on('#asset', (el) => {
     state.form.asset = (el as HTMLSelectElement).value;
     document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
     document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
+    document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
   }, 'change');
   on('#recipient', (el) => {
     state.form.recipient = (el as HTMLInputElement).value;

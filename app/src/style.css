@@ -101,6 +101,8 @@ a:hover { text-decoration: underline; }
 .balance { margin-top: 8px; font-size: 13px; color: var(--muted); }
 .token-note { margin: 8px 4px 0; padding: 9px 12px; border-radius: 12px; font-size: 13px; background: var(--warn-bg); color: var(--warn); }
 .token-note:empty { display: none; }
+.fee-note { margin: 8px 4px 0; font-size: 13px; color: var(--muted); }
+.fee-note:empty { display: none; }
 .token-note .error { color: var(--error); }
 
 .field { display: flex; align-items: center; gap: 12px; padding: 4px 6px 4px 18px; background: var(--field); border-radius: 18px; }

@@ -7,6 +7,9 @@ import {
   ExtensionType, TOKEN_2022_PROGRAM_ID, createInitializeMintInstruction, createInitializeTransferFeeConfigInstruction,
   createInitializeTransferHookInstruction, createMint, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
 } from '@solana/spl-token';
+import { fetchConfig, initializeConfigIx, updateConfigIx } from '../../src/lib/safeSend.ts';
+// The local validator's throwaway upgrade authority (test/fixtures/README.md): creates and changes the Config.
+import localAuthority from '../fixtures/local-authority.json';
 
 const load = <T>(key: string, fallback: T): T => JSON.parse(localStorage.getItem(`harness:${key}`) ?? 'null') ?? fallback;
 const save = (key: string, value: unknown) => localStorage.setItem(`harness:${key}`, JSON.stringify(value));
@@ -64,8 +67,26 @@ const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
   controls,
   connection,
   PublicKey,
+  // Sets Safe Send's fees on the local validator (creating the Config if needed); the treasury is the authority.
+  async setFees(feeBps: number, flatSol = 0) {
+    const authority = Keypair.fromSecretKey(Uint8Array.from(localAuthority));
+    if ((await connection.getBalance(authority.publicKey)) < LAMPORTS_PER_SOL) {
+      await connection.confirmTransaction(await connection.requestAirdrop(authority.publicKey, 10 * LAMPORTS_PER_SOL), 'confirmed');
+    }
+    const config = await fetchConfig(connection).catch(async () => {
+      await sendAndConfirmTransaction(connection, new Transaction().add(
+        initializeConfigIx({ authority: authority.publicKey, treasury: authority.publicKey })), [authority], { commitment: 'confirmed' });
+      return fetchConfig(connection);
+    });
+    await sendAndConfirmTransaction(connection, new Transaction().add(updateConfigIx({
+      admin: authority.publicKey,
+      config: { ...config, feeBps, flatFeeLamports: BigInt(Math.round(flatSol * LAMPORTS_PER_SOL)) },
+    })), [authority], { commitment: 'confirmed' });
+    return authority.publicKey.toBase58();
+  },
   // Creates `count` funded test accounts (fresh state: wallets list, trust and selection are reset).
   async setup(count: number, sol = 2) {
+    await (window as any).harness.setFees(0);
     const list = Array.from({ length: count }, () => Keypair.generate());
     localStorage.clear();
     save('keys', list.map((k) => Array.from(k.secretKey)));

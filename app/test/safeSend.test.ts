@@ -16,8 +16,9 @@ import {
 import {
   CLAIM_FEE_LAMPORTS, ESCROW_RESERVED, ESCROW_SIZE, cancelSolIx, claimFeeIxs, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress,
   incomingTransfers, mintInfos, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf, vaultAddress,
-  type MintInfo,
+  type FeeConfig, type MintInfo,
 } from '../src/lib/safeSend.ts';
+import { ensureConfig } from './helpers/config.ts';
 
 const connection = new Connection(process.env.TEST_RPC ?? 'http://127.0.0.1:8899', 'confirmed');
 
@@ -50,7 +51,9 @@ async function feeOf(signature: string): Promise<number> {
 }
 
 let sender: Keypair;
+let config: FeeConfig;
 before(async () => {
+  config = await ensureConfig(connection);
   sender = await funded(20);
 });
 
@@ -58,7 +61,7 @@ test('SOL: locked until the recipient verifies, then the recipient gets the amou
   const recipient = await funded(1);
   const id = newTransferId();
   const amount = 2n * BigInt(LAMPORTS_PER_SOL);
-  await run(sender, sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: amount }));
+  await run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: amount }));
   const escrow = escrowAddress(sender.publicKey, id);
   assert.ok((await balance(escrow)) > Number(amount));
 
@@ -88,7 +91,7 @@ test('SOL: a wrong address never verifies, and the sender cancels and gets every
   const id = newTransferId();
   const amount = BigInt(LAMPORTS_PER_SOL);
   const before = await balance(sender.publicKey);
-  const send = await run(sender, sendSolIx({ sender: sender.publicKey, recipient: wrong, id, lamports: amount }));
+  const send = await run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: wrong, id, lamports: amount }));
   const escrow = escrowAddress(sender.publicKey, id);
 
   // Only the sender can cancel
@@ -113,7 +116,7 @@ test('the extreme case: a recipient with 0 SOL gets the fee from the sender, the
   // Top-up and transfer in one transaction
   await run(sender,
     topUpIx(sender.publicKey, recipient.publicKey, check.topUp),
-    sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: amount }));
+    sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: amount }));
   assert.equal(await balance(recipient.publicKey), check.topUp);
   assert.equal((await checkRecipientFees(connection, recipient.publicKey)).topUp, 0);
 
@@ -127,15 +130,15 @@ test('the extreme case: a recipient with 0 SOL gets the fee from the sender, the
 test('without the top-up, a recipient with 0 SOL could not verify', async () => {
   const recipient = Keypair.generate();
   const id = newTransferId();
-  await run(sender, sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 1_000_000n }));
+  await run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 1_000_000n }));
   const tx = new Transaction().add(claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) }));
   await assert.rejects(sendAndConfirmTransaction(connection, tx, [recipient]), /insufficient|no record of a prior credit|AccountNotFound|debit an account/i);
   await run(sender, cancelSolIx({ sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) }));
 });
 
 test('invalid transfers are refused: to yourself, or of zero', async () => {
-  await rejects(run(sender, sendSolIx({ sender: sender.publicKey, recipient: sender.publicKey, id: newTransferId(), lamports: 1000n })), /cannot send to your own wallet/);
-  await rejects(run(sender, sendSolIx({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 0n })), /greater than zero/);
+  await rejects(run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: sender.publicKey, id: newTransferId(), lamports: 1000n })), /cannot send to your own wallet/);
+  await rejects(run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 0n })), /greater than zero/);
 });
 
 // A mint of `tokenProgram` with `supply` tokens in the sender's token account. For Token-2022, `extensions`
@@ -182,7 +185,7 @@ for (const [name, tokenProgram] of [['SPL Token', TOKEN_PROGRAM_ID], ['Token-202
 
     const recipient = await funded(1);
     const id = newTransferId();
-    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 250_000_000n }));
+    await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 250_000_000n }));
     const escrow = escrowAddress(sender.publicKey, id);
     assert.equal(await tokenBalance(info, vaultAddress(escrow)), 250_000_000n);
     assert.equal(await tokenBalance(info, ata(info, recipient.publicKey)), 0n); // created, still empty
@@ -200,7 +203,7 @@ for (const [name, tokenProgram] of [['SPL Token', TOKEN_PROGRAM_ID], ['Token-202
     // Cancel path: the tokens come back to the sender
     const id2 = newTransferId();
     const before = await tokenBalance(info, senderToken);
-    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
+    await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
     await run(sender, cancelTokenIx({ sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id2) }));
     assert.equal(await tokenBalance(info, senderToken), before);
     assert.equal(await connection.getAccountInfo(vaultAddress(escrowAddress(sender.publicKey, id2))), null);
@@ -210,7 +213,7 @@ for (const [name, tokenProgram] of [['SPL Token', TOKEN_PROGRAM_ID], ['Token-202
     const { info, senderToken } = await tokenWithBalance({ tokenProgram, decimals: 0, supply: 10n });
     const recipient = await funded(1);
     const id = newTransferId();
-    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 5n }));
+    await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 5n }));
     const escrow = escrowAddress(sender.publicKey, id);
     await rejects(run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow })), /different asset/);
     const stranger = await funded(1);
@@ -232,7 +235,7 @@ test('Token-2022 transfer fee: the escrow records what arrived, the withheld fee
   // Claim
   const recipient = await funded(1);
   const id = newTransferId();
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 1_000_000n }));
+  await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 1_000_000n }));
   const escrow = escrowAddress(sender.publicKey, id);
   assert.equal((await escrowOf(escrow))!.amount, 990_000n); // 1% withheld on the way in
   // Without the mint writable the withheld fee cannot be harvested: the claim fails as a whole (nothing moves)
@@ -252,7 +255,7 @@ test('Token-2022 transfer fee: the escrow records what arrived, the withheld fee
   // Cancel
   const id2 = newTransferId();
   const before = await tokenBalance(info, senderToken);
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
+  await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
   await run(sender, cancelTokenIx({ sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id2) }));
   assert.equal(await tokenBalance(info, senderToken), before - 1_000_000n + 990_000n - 9_900n);
   assert.equal(await connection.getAccountInfo(vaultAddress(escrowAddress(sender.publicKey, id2))), null);
@@ -267,7 +270,7 @@ test('Token-2022 transfer hook: refused at send time (a hook could block the rel
     });
     assert.equal(info.transferHook, true);
     const id = newTransferId();
-    await rejects(run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /transfer hook are not supported/);
+    await rejects(run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /transfer hook are not supported/);
     assert.equal(await tokenBalance(info, senderToken), 100n);
     assert.equal(await connection.getAccountInfo(escrowAddress(sender.publicKey, id)), null);
   }
@@ -283,7 +286,7 @@ test('Token-2022 permanent delegate: if the issuer moves tokens out of the vault
   const recipient = await funded(1);
   for (const [taken, release] of [[400n, 'claim'], [600n, 'cancel']] as const) {
     const id = newTransferId();
-    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 600n }));
+    await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 600n }));
     const escrow = escrowAddress(sender.publicKey, id);
     // The delegate (here the sender, as issuer) takes some or all of the vault
     await transferChecked(connection, sender, vaultAddress(escrow), info.mint, senderToken, sender, taken, 0, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
@@ -308,7 +311,7 @@ test('Token-2022 tokens that cannot be deposited fail the send as a whole: non-t
   });
   for (const { info, senderToken } of [nonTransferable, frozen]) {
     const id = newTransferId();
-    await rejects(run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /Transfer is disabled for this mint|Account is frozen/);
+    await rejects(run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /Transfer is disabled for this mint|Account is frozen/);
     assert.equal(await tokenBalance(info, senderToken), 100n);
     assert.equal(await connection.getAccountInfo(escrowAddress(sender.publicKey, id)), null);
   }
@@ -318,7 +321,7 @@ test('a vault frozen by the issuer blocks the claim only until it is thawed', as
   const { info, senderToken } = await tokenWithBalance({ tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 100n, decimals: 0, freezeAuthority: sender.publicKey });
   const recipient = await funded(1);
   const id = newTransferId();
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 40n }));
+  await run(sender, ...sendTokenIxs({ config, sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 40n }));
   const escrow = escrowAddress(sender.publicKey, id);
   await freezeAccount(connection, sender, vaultAddress(escrow), info.mint, sender, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
   await rejects(run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow })), /Account is frozen/);
@@ -330,7 +333,7 @@ test('a vault frozen by the issuer blocks the claim only until it is thawed', as
 test('escrow layout: version 1 and zeroed reserved bytes, so future fields fit without resizing', async () => {
   const recipient = Keypair.generate();
   const id = newTransferId();
-  await run(sender, sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 1_000_000n }));
+  await run(sender, sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 1_000_000n }));
   const escrow = escrowAddress(sender.publicKey, id);
   const info = await connection.getAccountInfo(escrow);
   assert.equal(info!.data.length, ESCROW_SIZE);

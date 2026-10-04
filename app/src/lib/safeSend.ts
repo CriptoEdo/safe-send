@@ -24,8 +24,11 @@ const IX = {
   sendToken: discriminator('global:send_token'),
   claimToken: discriminator('global:claim_token'),
   cancelToken: discriminator('global:cancel_token'),
+  initializeConfig: discriminator('global:initialize_config'),
+  updateConfig: discriminator('global:update_config'),
 };
 const ESCROW_DISCRIMINATOR = discriminator('account:Escrow');
+const CONFIG_DISCRIMINATOR = discriminator('account:Config');
 
 const u64 = (value: bigint) => {
   const bytes = new Uint8Array(8);
@@ -54,15 +57,66 @@ export function vaultAddress(escrow: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([encoder.encode('vault'), escrow.toBytes()], PROGRAM_ID)[0];
 }
 
+// --- Fee configuration ---
+
+export const CONFIG_ADDRESS = PublicKey.findProgramAddressSync([encoder.encode('config')], PROGRAM_ID)[0];
+const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+export const PROGRAM_DATA_ADDRESS = PublicKey.findProgramAddressSync([PROGRAM_ID.toBytes()], BPF_LOADER_UPGRADEABLE)[0];
+// Upper bounds fixed in the program (MAX_FEE_BPS, MAX_FLAT_FEE_LAMPORTS).
+export const MAX_FEE_BPS = 100;
+export const MAX_FLAT_FEE_LAMPORTS = 10_000_000n;
+
+export interface FeeConfig {
+  admin: PublicKey;
+  treasury: PublicKey;
+  feeBps: number; // basis points of the amount, paid in what is sent (30 = 0.3%)
+  flatFeeLamports: bigint; // fixed SOL fee per send
+}
+
+export async function fetchConfig(connection: Connection): Promise<FeeConfig> {
+  const account = await connection.getAccountInfo(CONFIG_ADDRESS);
+  if (!account) throw new Error('Safe Send is not configured on this network (no Config account)');
+  const bytes = account.data;
+  if (!CONFIG_DISCRIMINATOR.every((b, i) => bytes[i] === b)) throw new Error('Not a Safe Send Config account');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    admin: new PublicKey(bytes.subarray(8, 40)),
+    treasury: new PublicKey(bytes.subarray(40, 72)),
+    feeBps: view.getUint16(72, true),
+    flatFeeLamports: view.getBigUint64(74, true),
+  };
+}
+
+// The percentage fee on `amount`, rounded down like the program.
+export const percentFee = (config: FeeConfig, amount: bigint) => (amount * BigInt(config.feeBps)) / 10_000n;
+
+const u16 = (value: number) => {
+  const bytes = new Uint8Array(2);
+  new DataView(bytes.buffer).setUint16(0, value, true);
+  return bytes;
+};
+
 const w = (pubkey: PublicKey, isSigner = false) => ({ pubkey, isSigner, isWritable: true });
 const r = (pubkey: PublicKey) => ({ pubkey, isSigner: false, isWritable: false });
 const ix = (keys: TransactionInstruction['keys'], bytes: Buffer) => new TransactionInstruction({ programId: PROGRAM_ID, keys, data: bytes });
 
+// Creates the Config with no fees; only the program's upgrade authority can sign it.
+export function initializeConfigIx(p: { authority: PublicKey; treasury: PublicKey }) {
+  return ix([w(p.authority, true), w(CONFIG_ADDRESS), r(PROGRAM_DATA_ADDRESS), r(SystemProgram.programId)],
+    data(IX.initializeConfig, p.treasury.toBytes()));
+}
+
+export function updateConfigIx(p: { admin: PublicKey; config: FeeConfig }) {
+  return ix([{ pubkey: p.admin, isSigner: true, isWritable: false }, w(CONFIG_ADDRESS)], data(
+    IX.updateConfig, p.config.admin.toBytes(), p.config.treasury.toBytes(), u16(p.config.feeBps), u64(p.config.flatFeeLamports)));
+}
+
 // --- SOL ---
 
-export function sendSolIx(p: { sender: PublicKey; recipient: PublicKey; id: bigint; lamports: bigint }) {
+export function sendSolIx(p: { sender: PublicKey; recipient: PublicKey; id: bigint; lamports: bigint; config: FeeConfig }) {
   const escrow = escrowAddress(p.sender, p.id);
-  return ix([w(p.sender, true), r(p.recipient), w(escrow), r(SystemProgram.programId)], data(IX.sendSol, u64(p.id), u64(p.lamports)));
+  return ix([w(p.sender, true), r(p.recipient), r(CONFIG_ADDRESS), w(p.config.treasury), w(escrow), r(SystemProgram.programId)],
+    data(IX.sendSol, u64(p.id), u64(p.lamports)));
 }
 
 export function claimSolIx(p: { recipient: PublicKey; sender: PublicKey; escrow: PublicKey }) {
@@ -131,16 +185,20 @@ const tokenAccount = (mint: MintInfo, owner: PublicKey) => getAssociatedTokenAdd
 // The mint is written only when withheld transfer fees are harvested to it on release.
 const releaseMint = (mint: MintInfo) => (mint.transferFee ? w(mint.mint) : r(mint.mint));
 
-// Two instructions: create the recipient's token account if missing (paid by the sender, so verifying only
-// costs the recipient the fee), then lock the tokens.
-export function sendTokenIxs(p: { sender: PublicKey; recipient: PublicKey; mint: MintInfo; senderToken: PublicKey; id: bigint; amount: bigint }) {
+// Create the recipient's token account if missing (paid by the sender, so verifying only costs the recipient
+// the fee) and, with a percentage fee, the treasury's; then lock the tokens.
+export function sendTokenIxs(p: { sender: PublicKey; recipient: PublicKey; mint: MintInfo; senderToken: PublicKey; id: bigint; amount: bigint; config: FeeConfig }) {
   const escrow = escrowAddress(p.sender, p.id);
+  const treasuryToken = percentFee(p.config, p.amount) > 0n ? tokenAccount(p.mint, p.config.treasury) : null;
   return [
     createAssociatedTokenAccountIdempotentInstruction(
       p.sender, tokenAccount(p.mint, p.recipient), p.recipient, p.mint.mint, p.mint.tokenProgram),
+    ...(treasuryToken ? [createAssociatedTokenAccountIdempotentInstruction(
+      p.sender, treasuryToken, p.config.treasury, p.mint.mint, p.mint.tokenProgram)] : []),
     ix([
-      w(p.sender, true), r(p.recipient), r(p.mint.mint), w(p.senderToken), w(escrow), w(vaultAddress(escrow)),
-      r(p.mint.tokenProgram), r(SystemProgram.programId),
+      w(p.sender, true), r(p.recipient), r(p.mint.mint), w(p.senderToken),
+      r(CONFIG_ADDRESS), w(p.config.treasury), treasuryToken ? w(treasuryToken) : r(PROGRAM_ID), // PROGRAM_ID = none
+      w(escrow), w(vaultAddress(escrow)), r(p.mint.tokenProgram), r(SystemProgram.programId),
     ], data(IX.sendToken, u64(p.id), u64(p.amount))),
   ];
 }

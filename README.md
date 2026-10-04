@@ -66,7 +66,8 @@ The program builds in WSL/Linux with Solana CLI 2.0 and Anchor 0.30.1. Current c
 ```bash
 anchor build
 # end-to-end tests against a local validator
-solana-test-validator --reset --bpf-program EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg target/deploy/safe_send.so
+# (upgradeable, with the throwaway test authority, so the tests can create the fee Config: see app/test/fixtures)
+solana-test-validator --reset --upgradeable-program EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg target/deploy/safe_send.so 8igxrcwdyKwhBbvxs8WZmXGugvaMgDZ9Fu2w6TSyjnKC
 cd app && npm test
 # UI tests: the real app with a fake Phantom that signs with test keypairs, against the same local validator
 cd app && VITE_RPC_URL=http://127.0.0.1:8899 npx vite
@@ -74,11 +75,14 @@ cd app && VITE_RPC_URL=http://127.0.0.1:8899 npx vite
 #   await harness.setup(2); location.reload();   and after the reload:   await runSuite()
 # deploy to Devnet (needs ~2x the program size in rent, see `solana rent`)
 solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe_send-keypair.json --url devnet
+# then, once per network, create the fee Config (no fees) with the upgrade authority
+cd app && node scripts/config.ts init <authority-keypair.json> --treasury <treasury-address>
 ```
 
 ## Limits
 
 - The top-up for the recipient's fee is not refundable if the address is wrong (it is ~0.0009 SOL). A relayer that pays the claim fee and gets reimbursed from the escrow would avoid it.
+- Safe Send fee (off today): the Config PDA `["config"]` holds `fee_bps` (share of the amount, in what is sent) and `flat_fee_lamports` (SOL), paid by the sender on top of the amount and moved to the treasury at send time (not refunded on cancel). Both are 0; the program caps them at 1% and 0.01 SOL. Only the program's upgrade authority can create the Config; its admin changes it with `update_config` — `node scripts/config.ts show | init <keypair> --treasury <addr> | set <keypair> --fee-bps 30 --flat-sol 0.001 [--treasury <addr>] [--admin <addr>] [--rpc <url>]`. Hand the admin to a multisig with `--admin`.
 - Fees: every transaction sets its own compute budget (`app/src/lib/fees.ts`): units measured by simulating it (+15%), price from `getRecentPrioritizationFees` on the accounts it writes (75th percentile, at least 1,000 micro-lamports). The priority fee is capped at 0.001 SOL for senders, and for claims at what the recipient can pay above the rent-exempt minimum (≤ 90,000 lamports, within the top-up). The simulation also catches failing transactions before the wallet opens.
 - Token-2022: transfer-fee tokens are supported (the escrow records what reached the vault; the fee withheld in the vault is harvested to the mint so it can close, which needs the mint writable in claim/cancel). Tokens with a transfer hook are refused at send time, since a hook (even one set later) could block the release. With a permanent delegate the issuer can move tokens out of the vault; the release moves whatever is left. Tokens that cannot be deposited (non-transferable, frozen by default) fail the send as a whole.
 - Transfers have no expiry: the sender cancels by hand.

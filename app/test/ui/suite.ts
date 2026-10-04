@@ -5,6 +5,7 @@ const h = (window as any).harness;
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const $ = (s: string) => document.querySelector<HTMLElement>(`#app ${s}`);
+const $$ = (s: string) => [...document.querySelectorAll<HTMLElement>(`#app ${s}`)];
 const text = (s = '') => ((s ? $(s) : document.getElementById('app'))?.innerText ?? '').replace(/\s+/g, ' ');
 const tab = () => $('.seg.active')?.dataset.tab;
 const rpcRequests = () => performance.getEntriesByType('resource').filter((e) => e.name.includes(':8899')).length;
@@ -78,6 +79,33 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     check('send once on double click', h.controls.signs === signs + 1, String(h.controls.signs - signs));
     check('form cleared after send', ($('#amount') as HTMLInputElement).value === '' && ($('#recipient') as HTMLInputElement).value === '');
     await until(() => text('.segments').includes('Pending 1'), 'pending count');
+
+    // Fees on: the app shows the fee before sending and the treasury receives it
+    const treasury = await h.setFees(30, 0.001); // 0.3% + 0.001 SOL
+    await wait(21_000); // the config reloads with the wallet's data (tabs reload at most every 20 s)
+    click('[data-tab="incoming"]'); click('[data-tab="send"]');
+    type('#amount', '1');
+    await until(() => text('#fee-note').includes('0.003 SOL (0.3%)') && text('#fee-note').includes('0.001 SOL'), 'fee shown');
+    check('fee shown before sending', true);
+    type('#recipient', B);
+    await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B fee');
+    const treasuryBefore = await h.connection.getBalance(new h.PublicKey(treasury));
+    click('#send');
+    await until(() => $('#send-result .ok, #send-result .error'), 'sent with fee');
+    check('send with fee', !!$('#send-result .ok'), text('#send-result'));
+    check('treasury received 0.004 SOL', (await h.connection.getBalance(new h.PublicKey(treasury))) - treasuryBefore === 4_000_000);
+    await h.setFees(0);
+    await wait(21_000);
+    click('[data-tab="sent"]'); click('[data-tab="send"]');
+    await until(() => text('#fee-note') === '', 'fee hidden again');
+    check('no fee: nothing shown', true);
+    click('[data-tab="sent"]');
+    await until(() => $('[data-cancel]'), 'pending listed');
+    while ($('[data-cancel]') && $$('[data-cancel]').length > 1) { // keep only the first send for the cancel check
+      const last = $$('[data-cancel]').at(-1)!; last.click();
+      await until(() => $('#list-result .ok, #list-result .error'), 'cancel extra'); await wait(300);
+    }
+    click('[data-tab="send"]');
 
     // Cancel and refund
     click('[data-tab="sent"]');

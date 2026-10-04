@@ -6,6 +6,8 @@ resolver = "2"
 overflow-checks = true
 lto = "fat"
 codegen-units = 1
+# Optimize for size: a smaller program costs less rent to deploy and upgrade.
+opt-level = "s"
 
 [profile.release.build-override]
 opt-level = 3

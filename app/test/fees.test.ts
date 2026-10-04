@@ -6,7 +6,8 @@ import {
   BASE_FEE_LAMPORTS, MAX_CLAIM_PRIORITY_LAMPORTS, MAX_PRIORITY_LAMPORTS, MIN_MICRO_LAMPORTS, SimulationError,
   cappedPrice, claimPriorityCap, computeBudget, recentPrice,
 } from '../src/lib/fees.ts';
-import { checkRecipientFees, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx } from '../src/lib/safeSend.ts';
+import { checkRecipientFees, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx, type FeeConfig } from '../src/lib/safeSend.ts';
+import { ensureConfig } from './helpers/config.ts';
 
 const connection = new Connection(process.env.TEST_RPC ?? 'http://127.0.0.1:8899', 'confirmed');
 
@@ -46,7 +47,9 @@ async function feeOf(signature: string): Promise<{ fee: number; units: number }>
 }
 
 let sender: Keypair;
+let config: FeeConfig;
 before(async () => {
+  config = await ensureConfig(connection);
   sender = await funded(20);
 });
 
@@ -66,7 +69,7 @@ test('cap: the priority fee never exceeds the limit, and a negative budget means
 
 test('units are measured: the limit covers what the transaction uses, and it lands with it', async () => {
   const recipient = Keypair.generate();
-  const ixs = [sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id: newTransferId(), lamports: 1_000_000n })];
+  const ixs = [sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id: newTransferId(), lamports: 1_000_000n })];
   const budget = await computeBudget(connection, ixs, sender.publicKey);
   const { fee, units } = await feeOf(await run(sender, [...budget.instructions, ...ixs]));
   assert.ok(budget.units >= units, `limit ${budget.units} < used ${units}`);
@@ -75,7 +78,7 @@ test('units are measured: the limit covers what the transaction uses, and it lan
 });
 
 test('congested network: a sender never pays more than the priority cap', async () => {
-  const ixs = [sendSolIx({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 1_000_000n })];
+  const ixs = [sendSolIx({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 1_000_000n })];
   const budget = await computeBudget(congested, ixs, sender.publicKey);
   assert.ok(budget.priorityLamports <= MAX_PRIORITY_LAMPORTS);
   // Pays what the network asks for, up to the cap
@@ -89,7 +92,7 @@ test('congested network: a recipient funded only with the top-up can still claim
   const recipient = Keypair.generate(); // 0 SOL
   const check = await checkRecipientFees(connection, recipient.publicKey);
   const id = newTransferId();
-  await run(sender, [topUpIx(sender.publicKey, recipient.publicKey, check.topUp), sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 500_000_000n })]);
+  await run(sender, [topUpIx(sender.publicKey, recipient.publicKey, check.topUp), sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 500_000_000n })]);
 
   const cap = await claimPriorityCap(connection, recipient.publicKey);
   assert.ok(cap > 0 && cap <= MAX_CLAIM_PRIORITY_LAMPORTS, `cap ${cap}`);
@@ -103,7 +106,7 @@ test('congested network: a recipient funded only with the top-up can still claim
 
 test('a transaction that would fail is caught by the simulation, before the wallet', async () => {
   const id = newTransferId();
-  await run(sender, [sendSolIx({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, id, lamports: 1_000_000n })]);
+  await run(sender, [sendSolIx({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, id, lamports: 1_000_000n })]);
   const stranger = await funded(1);
   const ixs = [claimSolIx({ recipient: stranger.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) })];
   await assert.rejects(computeBudget(connection, ixs, stranger.publicKey), (err: SimulationError) => {
@@ -114,7 +117,7 @@ test('a transaction that would fail is caught by the simulation, before the wall
 });
 
 test('RPC that cannot simulate: a fixed budget that still lands', async () => {
-  const ixs = [sendSolIx({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 1_000_000n })];
+  const ixs = [sendSolIx({ config, sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 1_000_000n })];
   const budget = await computeBudget(broken, ixs, sender.publicKey);
   assert.equal(budget.units, 200_000);
   assert.equal(budget.microLamports, MIN_MICRO_LAMPORTS);

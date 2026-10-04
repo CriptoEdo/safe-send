@@ -4,9 +4,10 @@
 //   node scripts/devnet-fee-check.ts <path/to/sender-keypair.json>
 import { readFileSync } from 'node:fs';
 import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
-import { claimFeeIxs, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx } from '../src/lib/safeSend.ts';
+import { claimFeeIxs, claimSolIx, escrowAddress, newTransferId, sendSolIx, topUpIx, fetchConfig } from '../src/lib/safeSend.ts';
 
 const connection = new Connection(process.env.RPC_URL ?? 'https://api.devnet.solana.com', 'confirmed');
+const config = await fetchConfig(connection); // the fee configuration (fees, treasury)
 const sender = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.argv[2], 'utf8'))));
 const send = (signer: Keypair, ...ixs: Parameters<Transaction['add']>) =>
   sendAndConfirmTransaction(connection, new Transaction().add(...ixs), [signer], { commitment: 'confirmed' });
@@ -15,7 +16,7 @@ const recipient = Keypair.generate();
 const oldTopUp = (await connection.getMinimumBalanceForRentExemption(0)) + 20_000;
 const id = newTransferId();
 await send(sender, topUpIx(sender.publicKey, recipient.publicKey, oldTopUp),
-  sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: BigInt(0.01 * LAMPORTS_PER_SOL) }));
+  sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: BigInt(0.01 * LAMPORTS_PER_SOL) }));
 console.log(`recipient funded with the old top-up: ${oldTopUp} lamports`);
 const claim = claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) });
 

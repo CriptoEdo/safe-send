@@ -19,9 +19,16 @@
 //! Extensions that make the deposit itself fail (non-transferable, frozen by default, CPI guard) fail the send
 //! transaction as a whole, so nothing gets locked.
 //!
+//! Fees: a Config PDA ["config"] holds an optional fee per send, paid by the sender on top of the amount and
+//! moved to the treasury at send time (not refunded on cancel): `fee_bps` of the amount (in SOL, or in the
+//! token sent) plus `flat_fee_lamports` in SOL. Both start at zero and the admin changes them with
+//! `update_config`, within MAX_FEE_BPS and MAX_FLAT_FEE_LAMPORTS. Only the program's upgrade authority can
+//! create the Config, so nobody else can claim the admin role first.
+//!
 //! Token instructions box their accounts: Anchor deserializes them on the stack, which is 4 KB in SBF.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_2022::spl_token_2022;
@@ -36,6 +43,11 @@ declare_id!("EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg");
 
 pub const ESCROW_SEED: &[u8] = b"escrow";
 pub const VAULT_SEED: &[u8] = b"vault";
+pub const CONFIG_SEED: &[u8] = b"config";
+
+/// Upper bounds of the fees, fixed in the code: the admin can never charge more (1% and 0.01 SOL).
+pub const MAX_FEE_BPS: u16 = 100;
+pub const MAX_FLAT_FEE_LAMPORTS: u64 = 10_000_000;
 
 /// Layout version written in every new escrow. Bump it when a version changes how escrows are read, so the
 /// program can still handle the ones created by older versions.
@@ -48,9 +60,46 @@ pub const ESCROW_RESERVED: usize = 64;
 pub mod safe_send {
     use super::*;
 
-    /// Locks `amount` lamports for `recipient`. `id` is chosen by the sender (unique per sender).
+    /// Creates the fee configuration, with no fees. Only the program's upgrade authority can call it, once;
+    /// it becomes the admin.
+    pub fn initialize_config(ctx: Context<InitializeConfig>, treasury: Pubkey) -> Result<()> {
+        ctx.accounts.config.set_inner(Config {
+            admin: ctx.accounts.authority.key(),
+            treasury,
+            fee_bps: 0,
+            flat_fee_lamports: 0,
+            bump: ctx.bumps.config,
+            reserved: [0; CONFIG_RESERVED],
+        });
+        Ok(())
+    }
+
+    /// The admin sets the fees, the treasury and the admin itself (e.g. hand it to a multisig).
+    pub fn update_config(
+        ctx: Context<UpdateConfig>,
+        admin: Pubkey,
+        treasury: Pubkey,
+        fee_bps: u16,
+        flat_fee_lamports: u64,
+    ) -> Result<()> {
+        require!(fee_bps <= MAX_FEE_BPS, SafeSendError::FeeTooHigh);
+        require!(flat_fee_lamports <= MAX_FLAT_FEE_LAMPORTS, SafeSendError::FeeTooHigh);
+        let config = &mut ctx.accounts.config;
+        config.admin = admin;
+        config.treasury = treasury;
+        config.fee_bps = fee_bps;
+        config.flat_fee_lamports = flat_fee_lamports;
+        Ok(())
+    }
+
+    /// Locks `amount` lamports for `recipient`. `id` is chosen by the sender (unique per sender). The fee, if
+    /// any, is paid on top and goes to the treasury now.
     pub fn send_sol(ctx: Context<SendSol>, id: u64, amount: u64) -> Result<()> {
         require!(amount > 0, SafeSendError::ZeroAmount);
+        let fee = ctx.accounts.config.percent_fee(amount)?
+            .checked_add(ctx.accounts.config.flat_fee_lamports)
+            .ok_or(SafeSendError::FeeTooHigh)?;
+        pay_lamports(&ctx.accounts.system_program, &ctx.accounts.sender, &ctx.accounts.treasury, fee)?;
         system_program::transfer(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
@@ -104,6 +153,26 @@ pub mod safe_send {
             !token_2022_rules(&ctx.accounts.mint.to_account_info())?.transfer_hook,
             SafeSendError::UnsupportedToken
         );
+        // Fees on top: a share of the tokens to the treasury's token account, the flat fee in SOL.
+        let token_fee = ctx.accounts.config.percent_fee(amount)?;
+        if token_fee > 0 {
+            let treasury_token = ctx.accounts.treasury_token.as_ref().ok_or(SafeSendError::MissingTreasuryAccount)?;
+            token_interface::transfer_checked(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    TransferChecked {
+                        from: ctx.accounts.sender_token.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: treasury_token.to_account_info(),
+                        authority: ctx.accounts.sender.to_account_info(),
+                    },
+                ),
+                token_fee,
+                ctx.accounts.mint.decimals,
+            )?;
+        }
+        let flat_fee = ctx.accounts.config.flat_fee_lamports;
+        pay_lamports(&ctx.accounts.system_program, &ctx.accounts.sender, &ctx.accounts.treasury, flat_fee)?;
         token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -160,6 +229,35 @@ pub mod safe_send {
             &a.token_program,
         )
     }
+}
+
+// The upgrade authority stored in a ProgramData account: a u32 tag (3 = ProgramData), the deploy slot (u64),
+// then an Option<Pubkey> (1-byte flag + 32 bytes). Read by hand to avoid pulling bincode into the program.
+fn upgrade_authority(program_data: &AccountInfo) -> Result<Option<Pubkey>> {
+    let data = program_data.try_borrow_data()?;
+    require!(data.len() >= 45 && data[..4] == 3u32.to_le_bytes(), SafeSendError::NotAdmin);
+    Ok(match data[12] {
+        1 => Some(Pubkey::try_from(&data[13..45]).map_err(|_| error!(SafeSendError::NotAdmin))?),
+        _ => None,
+    })
+}
+
+fn pay_lamports<'info>(
+    system_program: &Program<'info, System>,
+    from: &Signer<'info>,
+    to: &UncheckedAccount<'info>,
+    lamports: u64,
+) -> Result<()> {
+    if lamports == 0 {
+        return Ok(());
+    }
+    system_program::transfer(
+        CpiContext::new(
+            system_program.to_account_info(),
+            system_program::Transfer { from: from.to_account_info(), to: to.to_account_info() },
+        ),
+        lamports,
+    )
 }
 
 /// The Token-2022 extensions of a mint that change how an escrow works (all false for SPL Token mints).
@@ -239,6 +337,32 @@ fn release_vault<'info>(
     ))
 }
 
+/// Zeroed bytes at the end of the Config for settings added later (zero = "not set").
+pub const CONFIG_RESERVED: usize = 64;
+
+#[account]
+#[derive(InitSpace)]
+pub struct Config {
+    /// Can change everything here with `update_config` (a wallet, or a multisig).
+    pub admin: Pubkey,
+    /// Receives the fees: SOL directly, tokens in its token accounts.
+    pub treasury: Pubkey,
+    /// Fee in basis points of the amount sent (30 = 0.3%), paid in what is sent. At most MAX_FEE_BPS.
+    pub fee_bps: u16,
+    /// Fixed fee in lamports per send. At most MAX_FLAT_FEE_LAMPORTS.
+    pub flat_fee_lamports: u64,
+    pub bump: u8,
+    pub reserved: [u8; CONFIG_RESERVED],
+}
+
+impl Config {
+    /// `fee_bps` of `amount`, rounded down.
+    pub fn percent_fee(&self, amount: u64) -> Result<u64> {
+        let fee = (amount as u128) * (self.fee_bps as u128) / 10_000;
+        u64::try_from(fee).map_err(|_| error!(SafeSendError::FeeTooHigh))
+    }
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Escrow {
@@ -257,6 +381,28 @@ pub struct Escrow {
 }
 
 #[derive(Accounts)]
+pub struct InitializeConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(init, payer = authority, space = 8 + Config::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
+    pub config: Account<'info, Config>,
+    /// CHECK: this program's ProgramData account (address checked); its upgrade authority is read by hand.
+    #[account(
+        address = Pubkey::find_program_address(&[crate::ID.as_ref()], &bpf_loader_upgradeable::ID).0,
+        constraint = upgrade_authority(&program_data)? == Some(authority.key()) @ SafeSendError::NotAdmin,
+    )]
+    pub program_data: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateConfig<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ SafeSendError::NotAdmin)]
+    pub config: Account<'info, Config>,
+}
+
+#[derive(Accounts)]
 #[instruction(id: u64)]
 pub struct SendSol<'info> {
     #[account(mut)]
@@ -264,6 +410,11 @@ pub struct SendSol<'info> {
     /// CHECK: any address. It only has to sign the claim to receive the funds.
     #[account(constraint = recipient.key() != sender.key() @ SafeSendError::SelfTransfer)]
     pub recipient: UncheckedAccount<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    /// CHECK: the treasury in the config; receives the fee.
+    #[account(mut, address = config.treasury @ SafeSendError::WrongTreasury)]
+    pub treasury: UncheckedAccount<'info>,
     #[account(
         init,
         payer = sender,
@@ -320,6 +471,19 @@ pub struct SendToken<'info> {
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, token::mint = mint, token::authority = sender, token::token_program = token_program)]
     pub sender_token: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: the treasury in the config; receives the flat fee.
+    #[account(mut, address = config.treasury @ SafeSendError::WrongTreasury)]
+    pub treasury: UncheckedAccount<'info>,
+    /// The treasury's account for this token; needed only when there is a percentage fee.
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = config.treasury,
+        token::token_program = token_program,
+    )]
+    pub treasury_token: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
     #[account(
         init,
         payer = sender,
@@ -423,4 +587,12 @@ pub enum SafeSendError {
     InsufficientEscrow,
     #[msg("Tokens with a transfer hook are not supported")]
     UnsupportedToken,
+    #[msg("Only the admin can change the configuration")]
+    NotAdmin,
+    #[msg("The fee is above the maximum allowed")]
+    FeeTooHigh,
+    #[msg("The treasury account does not match the configuration")]
+    WrongTreasury,
+    #[msg("The treasury's token account is required when there is a percentage fee")]
+    MissingTreasuryAccount,
 }
