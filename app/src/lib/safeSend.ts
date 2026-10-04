@@ -113,12 +113,16 @@ export interface PendingTransfer {
   amount: bigint; // lamports or token base units
   id: bigint;
   createdAt: number; // ms
+  version: number; // escrow layout version
 }
 
-// Escrow layout: discriminator (8) + sender (32) + recipient (32) + mint (32) + amount, id, created_at (8 each) + bump.
+// Escrow layout: discriminator (8) + sender (32) + recipient (32) + mint (32) + amount, id, created_at (8 each)
+// + bump (1) + version (1) + reserved (64, zero: room for future fields without changing the size).
 const SENDER_OFFSET = 8;
 const RECIPIENT_OFFSET = 40;
-export const ESCROW_SIZE = 8 + 32 * 3 + 8 * 3 + 1;
+const VERSION_OFFSET = 129;
+export const ESCROW_RESERVED = 64;
+export const ESCROW_SIZE = 8 + 32 * 3 + 8 * 3 + 1 + 1 + ESCROW_RESERVED;
 
 export function decodeEscrow(address: PublicKey, account: Pick<AccountInfo<Buffer>, 'data'>): PendingTransfer | null {
   const bytes = account.data;
@@ -134,6 +138,7 @@ export function decodeEscrow(address: PublicKey, account: Pick<AccountInfo<Buffe
     amount: view.getBigUint64(104, true),
     id: view.getBigUint64(112, true),
     createdAt: Number(view.getBigInt64(120, true)) * 1000,
+    version: bytes[VERSION_OFFSET],
   };
 }
 

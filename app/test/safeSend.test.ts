@@ -8,7 +8,7 @@ import {
 } from '@solana/web3.js';
 import { createMint, getAccount, getAssociatedTokenAddressSync, getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import {
-  CLAIM_FEE_LAMPORTS, cancelSolIx, claimFeeIxs, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress,
+  CLAIM_FEE_LAMPORTS, ESCROW_RESERVED, ESCROW_SIZE, cancelSolIx, claimFeeIxs, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress,
   incomingTransfers, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, vaultAddress,
 } from '../src/lib/safeSend.ts';
 
@@ -35,6 +35,13 @@ async function rejects(promise: Promise<unknown>, message: RegExp) {
 
 const balance = (k: PublicKey) => connection.getBalance(k);
 
+// The fee a transaction actually paid. A freshly started validator charges 0 per signature for its first
+// blocks, so tests read the fee instead of assuming 5,000 lamports.
+async function feeOf(signature: string): Promise<number> {
+  const tx = await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+  return tx!.meta!.fee;
+}
+
 let sender: Keypair;
 before(async () => {
   sender = await funded(20);
@@ -60,9 +67,9 @@ test('SOL: locked until the recipient verifies, then the recipient gets the amou
 
   const recipientBefore = await balance(recipient.publicKey);
   const senderBefore = await balance(sender.publicKey);
-  await run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow }));
+  const claim = await run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow }));
   // Recipient: + amount - fee. Sender: + escrow rent back.
-  assert.equal(await balance(recipient.publicKey), recipientBefore + Number(amount) - 5000);
+  assert.equal(await balance(recipient.publicKey), recipientBefore + Number(amount) - await feeOf(claim));
   assert.ok((await balance(sender.publicKey)) > senderBefore);
   assert.equal(await connection.getAccountInfo(escrow), null);
   // Verified once: nothing left to verify
@@ -74,17 +81,17 @@ test('SOL: a wrong address never verifies, and the sender cancels and gets every
   const id = newTransferId();
   const amount = BigInt(LAMPORTS_PER_SOL);
   const before = await balance(sender.publicKey);
-  await run(sender, sendSolIx({ sender: sender.publicKey, recipient: wrong, id, lamports: amount }));
+  const send = await run(sender, sendSolIx({ sender: sender.publicKey, recipient: wrong, id, lamports: amount }));
   const escrow = escrowAddress(sender.publicKey, id);
 
   // Only the sender can cancel
   const other = await funded(1);
   await rejects(run(other, cancelSolIx({ sender: other.publicKey, escrow })), /ConstraintSeeds|Only the sender|seeds constraint/i);
 
-  await run(sender, cancelSolIx({ sender: sender.publicKey, escrow }));
+  const cancel = await run(sender, cancelSolIx({ sender: sender.publicKey, escrow }));
   assert.equal(await connection.getAccountInfo(escrow), null);
   // Back to the starting balance, minus the two transaction fees
-  assert.equal(await balance(sender.publicKey), before - 2 * 5000);
+  assert.equal(await balance(sender.publicKey), before - await feeOf(send) - await feeOf(cancel));
 });
 
 test('the extreme case: a recipient with 0 SOL gets the fee from the sender, then verifies paying it themselves', async () => {
@@ -103,9 +110,11 @@ test('the extreme case: a recipient with 0 SOL gets the fee from the sender, the
   assert.equal(await balance(recipient.publicKey), check.topUp);
   assert.equal((await checkRecipientFees(connection, recipient.publicKey)).topUp, 0);
 
-  // The recipient pays its own fee to verify, with the app's compute budget (5,000 + 100 lamports of priority)
-  await run(recipient, ...claimFeeIxs(), claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) }));
-  assert.equal(await balance(recipient.publicKey), check.topUp + Number(amount) - 5100);
+  // The recipient pays its own fee to verify, with the app's compute budget: at most 5,000 + 100 lamports of priority
+  const claim = await run(recipient, ...claimFeeIxs(), claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id) }));
+  const fee = await feeOf(claim);
+  assert.ok(fee <= 5100, `claim fee ${fee}`);
+  assert.equal(await balance(recipient.publicKey), check.topUp + Number(amount) - fee);
 });
 
 test('without the top-up, a recipient with 0 SOL could not verify', async () => {
@@ -166,3 +175,17 @@ test('a token transfer cannot be verified as SOL, nor by the wrong wallet', asyn
   await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint, escrow }));
 });
 
+
+test('escrow layout: version 1 and zeroed reserved bytes, so future fields fit without resizing', async () => {
+  const recipient = Keypair.generate();
+  const id = newTransferId();
+  await run(sender, sendSolIx({ sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 1_000_000n }));
+  const escrow = escrowAddress(sender.publicKey, id);
+  const info = await connection.getAccountInfo(escrow);
+  assert.equal(info!.data.length, ESCROW_SIZE);
+  assert.equal(ESCROW_SIZE, 8 + 32 * 3 + 8 * 3 + 1 + 1 + ESCROW_RESERVED);
+  const [t] = (await outgoingTransfers(connection, sender.publicKey)).filter((x) => x.address.equals(escrow));
+  assert.equal(t.version, 1);
+  assert.ok(info!.data.subarray(ESCROW_SIZE - ESCROW_RESERVED).every((b) => b === 0));
+  await run(sender, cancelSolIx({ sender: sender.publicKey, escrow }));
+});

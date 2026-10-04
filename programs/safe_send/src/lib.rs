@@ -22,6 +22,13 @@ declare_id!("EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg");
 pub const ESCROW_SEED: &[u8] = b"escrow";
 pub const VAULT_SEED: &[u8] = b"vault";
 
+/// Layout version written in every new escrow. Bump it when a version changes how escrows are read, so the
+/// program can still handle the ones created by older versions.
+pub const ESCROW_VERSION: u8 = 1;
+/// Zeroed bytes at the end of each escrow for fields added later (e.g. an expiry or a fee), so adding them
+/// does not resize the escrows that already exist. A new field must treat zero as "not set".
+pub const ESCROW_RESERVED: usize = 64;
+
 #[program]
 pub mod safe_send {
     use super::*;
@@ -47,6 +54,8 @@ pub mod safe_send {
             id,
             created_at: Clock::get()?.unix_timestamp,
             bump: ctx.bumps.escrow,
+            version: ESCROW_VERSION,
+            reserved: [0; ESCROW_RESERVED],
         });
         Ok(())
     }
@@ -95,6 +104,8 @@ pub mod safe_send {
             id,
             created_at: Clock::get()?.unix_timestamp,
             bump: ctx.bumps.escrow,
+            version: ESCROW_VERSION,
+            reserved: [0; ESCROW_RESERVED],
         });
         Ok(())
     }
@@ -169,6 +180,10 @@ pub struct Escrow {
     pub id: u64,
     pub created_at: i64,
     pub bump: u8,
+    /// ESCROW_VERSION when created.
+    pub version: u8,
+    /// Space for future fields, all zero today (see ESCROW_RESERVED).
+    pub reserved: [u8; ESCROW_RESERVED],
 }
 
 #[derive(Accounts)]
