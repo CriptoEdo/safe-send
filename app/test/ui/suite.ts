@@ -124,25 +124,10 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await until(() => $('#send-result .ok, #send-result .error'), 'send back');
     check('send back from the second wallet', !!$('#send-result .ok'), text('#send-result'));
 
-    // Disconnect B only: A stays connected, B needs a new signature
+    // Disconnect: switching accounts in Phantom no longer reconnects
     click('[data-menu]'); click('[data-disconnect]'); await wait(200);
-    check('disconnect removes only that wallet', text('.wallet-list').includes(A.slice(0, 4)) && !text('.wallet-list').includes(B.slice(0, 4)), text('.wallet-list'));
-    h.select(0);
-    await until(() => text('.top').includes(A.slice(0, 4)), 'A still connected');
-    check('other wallet still connected', true);
-    h.select(1); await wait(300);
-    check('disconnected wallet not followed', !$('.wallet') && text('.switch-hint').includes('You disconnected'), text().slice(0, 250));
-    const signed = h.controls.messages;
-    click('.switch-hint [data-connect]');
-    await until(() => text('.top').includes(B.slice(0, 4)), 'B reconnected');
-    check('reconnecting asks a signature', h.controls.messages === signed + 1, String(h.controls.messages - signed));
-
-    // Disconnect both: nothing reconnects until Connect Phantom
-    click('[data-menu]'); click('[data-disconnect]'); await wait(200);
-    h.select(0); await until(() => text('.top').includes(A.slice(0, 4)), 'A active');
-    click('[data-menu]'); click('[data-disconnect]'); await wait(200);
-    h.select(1); await wait(300); h.select(0); await wait(300);
-    check('last wallet disconnected: fully disconnected', !$('.wallet') && text().includes('Connect Phantom') && !$('.wallet-list'), text().slice(0, 200));
+    h.select(0); await wait(300); h.select(1); await wait(300);
+    check('disconnected: stays disconnected', !$('.wallet') && text().includes('Connect Phantom'), text().slice(0, 200));
   } catch (err) {
     check('suite crashed', false, String((err as Error).message));
   }

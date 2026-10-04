@@ -6,7 +6,7 @@ import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimFeeIxs, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
   newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, type FeeCheck, type PendingTransfer,
 } from './lib/safeSend.ts';
-import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
+import { approveAccount, connectWithSignature, connectedWallets, disconnectAll, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
 const RPC_URL = import.meta.env.VITE_RPC_URL ?? 'https://api.devnet.solana.com';
 // Rate limits are retried below with a bounded number of attempts, not by web3.js's own open-ended backoff.
@@ -234,7 +234,7 @@ function header(): string {
           <div class="menu-label">Switch wallet</div>
           ${connectedWallets().map(walletRow).join('')}
           <button role="menuitem" data-add>＋ Add another wallet</button>
-          <button role="menuitem" class="danger" data-disconnect>Disconnect ${short(state.wallet)}</button>
+          <button role="menuitem" class="danger" data-disconnect>Disconnect</button>
         </div>` : ''}
       </div>`
     : ''; // not connected: the welcome screen has the connect button
@@ -263,11 +263,8 @@ function walletNotice(): string {
   if (state.notice?.kind === 'not-connected') {
     return `<div class="switch-hint">
       <strong>${state.notice.account ? `${short(state.notice.account)} is not connected` : 'This Phantom account is not connected'}</strong>
-      ${state.notice.account && isDisconnected(state.notice.account)
-        ? `You disconnected it: connect it again with a signature${connectedWallets().length ? ', or select one of your wallets in Phantom' : ''}.
-          <button class="pill primary small" data-connect>Connect &amp; sign</button>`
-        : `Approve it in Phantom to use it here.
-          <button class="pill primary small" data-connect>Connect</button>`}
+      Approve it in Phantom to use it here.
+      <button class="pill primary small" data-connect>Connect</button>
     </div>`;
   }
   return '';
@@ -623,27 +620,22 @@ async function connectNew(): Promise<void> {
   if (connecting) return; // Phantom is already asking
   connecting = true;
   try {
-    // A signature for the first connection and to bring back a wallet the user disconnected; otherwise
-    // approving another account in Phantom is enough.
-    const selected = (await selectedAccount())?.toBase58();
-    const needsSignature = connectedWallets().length === 0 || (!!selected && isDisconnected(selected));
-    const wallet = needsSignature ? await connectWithSignature() : await approveAccount();
+    // First connection: a signature. Already connected: approving another account in Phantom is enough.
+    const wallet = connectedWallets().length ? await approveAccount() : await connectWithSignature();
     if (wallet) activate(wallet.toBase58());
   } finally {
     connecting = false;
   }
 }
 
-// Disconnects the active wallet only: the others stay connected and can be selected in Phantom. The
-// disconnected one needs a new signature to come back.
+// Disconnects Safe Send from Phantom (all accounts): it stays disconnected until "Connect Phantom" again.
 async function disconnectActive(): Promise<void> {
   if (!state.wallet) return;
-  const wallet = state.wallet.toBase58();
-  const done = disconnectWallet(wallet); // updates the lists right away, before the page re-renders
+  const revoked = disconnectAll(); // forgets the wallets right away, before the page shows the welcome screen
   clearWallet();
-  Object.assign(state, { pending: null, notice: connectedWallets().length ? { kind: 'not-connected', account: wallet } : null });
+  Object.assign(state, { pending: null, notice: null });
   render();
-  await done;
+  await revoked;
 }
 
 // Close the wallet menu when clicking anywhere else.
@@ -660,11 +652,6 @@ phantom()?.on('accountChanged', async (key) => {
   if (connectedWallets().length === 0) return; // disconnected: wait for "Connect Phantom"
   if (key) {
     const account = key.toString();
-    if (isDisconnected(account)) {
-      clearWallet();
-      Object.assign(state, { pending: null, notice: { kind: 'not-connected', account } });
-      return render();
-    }
     rememberWallet(account);
     return activate(account);
   }
@@ -688,12 +675,7 @@ render();
 // Back on the page: resume with the account selected in Phantom, unless the user disconnected.
 void selectedAccount().then((selected) => {
   if (!selected || state.wallet || connectedWallets().length === 0) return;
-  const account = selected.toBase58();
-  if (isDisconnected(account)) {
-    Object.assign(state, { notice: { kind: 'not-connected', account } });
-    return render();
-  }
-  rememberWallet(account);
-  activate(account);
+  rememberWallet(selected.toBase58());
+  activate(selected.toBase58());
 });
 
