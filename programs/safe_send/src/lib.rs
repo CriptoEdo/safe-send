@@ -25,6 +25,9 @@
 //! `update_config`, within MAX_FEE_BPS and MAX_FLAT_FEE_LAMPORTS. Only the program's upgrade authority can
 //! create the Config, so nobody else can claim the admin role first.
 //!
+//! Events (Anchor `emit!`, in the transaction logs): TransferSent, TransferClaimed, TransferCancelled and
+//! ConfigUpdated, for indexers, notifications and monitoring.
+//!
 //! Token instructions box their accounts: Anchor deserializes them on the stack, which is 4 KB in SBF.
 
 use anchor_lang::prelude::*;
@@ -89,6 +92,7 @@ pub mod safe_send {
         config.treasury = treasury;
         config.fee_bps = fee_bps;
         config.flat_fee_lamports = flat_fee_lamports;
+        emit!(ConfigUpdated { admin, treasury, fee_bps, flat_fee_lamports });
         Ok(())
     }
 
@@ -121,6 +125,15 @@ pub mod safe_send {
             version: ESCROW_VERSION,
             reserved: [0; ESCROW_RESERVED],
         });
+        emit!(TransferSent {
+            escrow: ctx.accounts.escrow.key(),
+            sender: ctx.accounts.sender.key(),
+            recipient: ctx.accounts.recipient.key(),
+            mint: Pubkey::default(),
+            amount,
+            fee: fee - ctx.accounts.config.flat_fee_lamports,
+            flat_fee_lamports: ctx.accounts.config.flat_fee_lamports,
+        });
         Ok(())
     }
 
@@ -137,11 +150,15 @@ pub mod safe_send {
             .lamports()
             .checked_add(amount)
             .ok_or(SafeSendError::InsufficientEscrow)?;
+        let e = &ctx.accounts.escrow;
+        emit!(TransferClaimed { escrow: e.key(), sender: e.sender, recipient: e.recipient, mint: e.mint, amount });
         Ok(()) // `close = sender` returns the rest (the rent)
     }
 
     /// The sender takes the transfer back before it is verified: everything returns to them.
-    pub fn cancel_sol(_ctx: Context<CancelSol>) -> Result<()> {
+    pub fn cancel_sol(ctx: Context<CancelSol>) -> Result<()> {
+        let e = &ctx.accounts.escrow;
+        emit!(TransferCancelled { escrow: e.key(), sender: e.sender, recipient: e.recipient, mint: e.mint, amount: e.amount });
         Ok(()) // `close = sender` returns the amount and the rent
     }
 
@@ -201,33 +218,48 @@ pub mod safe_send {
             version: ESCROW_VERSION,
             reserved: [0; ESCROW_RESERVED],
         });
+        emit!(TransferSent {
+            escrow: ctx.accounts.escrow.key(),
+            sender: ctx.accounts.sender.key(),
+            recipient: ctx.accounts.recipient.key(),
+            mint: ctx.accounts.mint.key(),
+            amount: received,
+            fee: token_fee,
+            flat_fee_lamports: flat_fee,
+        });
         Ok(())
     }
 
     /// The recipient verifies the token transfer: tokens to their account, rent back to the sender.
     pub fn claim_token(ctx: Context<ClaimToken>) -> Result<()> {
         let a = ctx.accounts;
-        release_vault(
+        let amount = release_vault(
             &a.escrow,
             &a.vault,
             &a.mint,
             &a.recipient_token,
             &a.sender.to_account_info(),
             &a.token_program,
-        )
+        )?;
+        let e = &a.escrow;
+        emit!(TransferClaimed { escrow: e.key(), sender: e.sender, recipient: e.recipient, mint: e.mint, amount });
+        Ok(())
     }
 
     /// The sender takes the token transfer back before it is verified.
     pub fn cancel_token(ctx: Context<CancelToken>) -> Result<()> {
         let a = ctx.accounts;
-        release_vault(
+        let amount = release_vault(
             &a.escrow,
             &a.vault,
             &a.mint,
             &a.sender_token,
             &a.sender.to_account_info(),
             &a.token_program,
-        )
+        )?;
+        let e = &a.escrow;
+        emit!(TransferCancelled { escrow: e.key(), sender: e.sender, recipient: e.recipient, mint: e.mint, amount });
+        Ok(())
     }
 }
 
@@ -283,8 +315,9 @@ fn token_2022_rules(mint: &AccountInfo) -> Result<Token2022Rules> {
     Ok(Token2022Rules { transfer_fee: state.get_extension::<TransferFeeConfig>().is_ok(), transfer_hook })
 }
 
-// Moves everything in the vault to `to` and closes it (rent to `rent_to`), signing as the escrow PDA. The whole
-// balance, not `escrow.amount`: with a permanent delegate the issuer may have moved tokens out meanwhile.
+// Moves everything in the vault to `to` and closes it (rent to `rent_to`), signing as the escrow PDA, and returns
+// the amount moved. The whole balance, not `escrow.amount`: with a permanent delegate the issuer may have moved
+// tokens out meanwhile.
 fn release_vault<'info>(
     escrow: &Account<'info, Escrow>,
     vault: &InterfaceAccount<'info, TokenAccount>,
@@ -292,7 +325,7 @@ fn release_vault<'info>(
     to: &InterfaceAccount<'info, TokenAccount>,
     rent_to: &AccountInfo<'info>,
     token_program: &Interface<'info, TokenInterface>,
-) -> Result<()> {
+) -> Result<u64> {
     let id = escrow.id.to_le_bytes();
     let seeds: &[&[u8]] = &[ESCROW_SEED, escrow.sender.as_ref(), &id, &[escrow.bump]];
     let signer = &[seeds];
@@ -334,7 +367,50 @@ fn release_vault<'info>(
             authority: escrow.to_account_info(),
         },
         signer,
-    ))
+    ))?;
+    Ok(vault.amount)
+}
+
+/// A transfer was locked in an escrow. `mint` is Pubkey::default() for SOL; `amount` is what the escrow holds
+/// (for tokens with a transfer fee, what reached the vault); `fee` is Safe Send's percentage fee, paid in the
+/// same asset, and `flat_fee_lamports` its fixed SOL fee.
+#[event]
+pub struct TransferSent {
+    pub escrow: Pubkey,
+    pub sender: Pubkey,
+    pub recipient: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+    pub fee: u64,
+    pub flat_fee_lamports: u64,
+}
+
+/// The recipient claimed the transfer; `amount` is what was released to them.
+#[event]
+pub struct TransferClaimed {
+    pub escrow: Pubkey,
+    pub sender: Pubkey,
+    pub recipient: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+/// The sender cancelled the transfer; `amount` is what came back to them.
+#[event]
+pub struct TransferCancelled {
+    pub escrow: Pubkey,
+    pub sender: Pubkey,
+    pub recipient: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct ConfigUpdated {
+    pub admin: Pubkey,
+    pub treasury: Pubkey,
+    pub fee_bps: u16,
+    pub flat_fee_lamports: u64,
 }
 
 /// Zeroed bytes at the end of the Config for settings added later (zero = "not set").

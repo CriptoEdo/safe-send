@@ -12,7 +12,7 @@ import {
 } from '@solana/spl-token';
 import {
   CONFIG_ADDRESS, cancelSolIx, claimSolIx, claimTokenIx, escrowAddress, fetchConfig, initializeConfigIx, mintInfos,
-  newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, updateConfigIx, type FeeConfig, type MintInfo,
+  newTransferId, outgoingTransfers, parseEvents, sendSolIx, sendTokenIxs, updateConfigIx, type FeeConfig, type MintInfo,
 } from '../src/lib/safeSend.ts';
 import { LOCAL_AUTHORITY, ensureConfig, setConfig } from './helpers/config.ts';
 
@@ -112,6 +112,36 @@ test('SOL with fees: the sender pays on top, the recipient gets the exact amount
   assert.equal(await balance(treasury.publicKey), 2 * fee);
 });
 
+test('events: every send, claim, cancel and config change is logged with its amounts', async () => {
+  const logsOf = async (signature: string) =>
+    (await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }))!.meta!.logMessages!;
+  const config = await setConfig(connection, { feeBps: 30, flatFeeLamports: 1_000_000n });
+  const recipient = await funded(1);
+  const id = newTransferId();
+  const escrow = escrowAddress(sender.publicKey, id);
+  const sent = parseEvents(await logsOf(await run([sender], sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id, lamports: 2_000_000_000n }))));
+  assert.deepEqual(sent.map((e) => e.name), ['TransferSent']);
+  const s = sent[0] as Extract<typeof sent[0], { name: 'TransferSent' }>;
+  assert.ok(s.escrow.equals(escrow) && s.sender.equals(sender.publicKey) && s.recipient.equals(recipient.publicKey) && s.mint.equals(PublicKey.default));
+  assert.equal(s.amount, 2_000_000_000n);
+  assert.equal(s.fee, 6_000_000n);
+  assert.equal(s.flatFeeLamports, 1_000_000n);
+
+  const claimed = parseEvents(await logsOf(await run([recipient], claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow }))));
+  assert.equal(claimed[0].name, 'TransferClaimed');
+  assert.equal((claimed[0] as { amount: bigint }).amount, 2_000_000_000n);
+
+  const id2 = newTransferId();
+  await run([sender], sendSolIx({ config, sender: sender.publicKey, recipient: recipient.publicKey, id: id2, lamports: 5_000_000n }));
+  const cancelled = parseEvents(await logsOf(await run([sender], cancelSolIx({ sender: sender.publicKey, escrow: escrowAddress(sender.publicKey, id2) }))));
+  assert.equal(cancelled[0].name, 'TransferCancelled');
+  assert.equal((cancelled[0] as { amount: bigint }).amount, 5_000_000n);
+
+  const updated = parseEvents(await logsOf(await run([LOCAL_AUTHORITY], updateConfigIx({ admin: LOCAL_AUTHORITY.publicKey, config: { ...config, feeBps: 0, flatFeeLamports: 0n } }))));
+  assert.deepEqual(updated.map((e) => e.name), ['ConfigUpdated']);
+  assert.equal((updated[0] as { feeBps: number }).feeBps, 0);
+});
+
 test('the fee must go to the treasury in the Config', async () => {
   const config = await setConfig(connection, { feeBps: 30, flatFeeLamports: 0n });
   const elsewhere = Keypair.generate().publicKey;
@@ -164,8 +194,12 @@ test('Token-2022 with its own transfer fee and our fee: each transfer pays the t
   // Our 1% fee (100,000) arrives minus the token's 0.5%; the escrow holds 10,000,000 minus 0.5%
   assert.equal(await tokenBalance(info, treasury.publicKey), 100_000n - 500n);
   assert.equal((await outgoingTransfers(connection, sender.publicKey)).find((t) => t.address.equals(escrowAddress(sender.publicKey, id)))!.amount, 9_950_000n);
-  await run([recipient], claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id) }));
+  const claim = await run([recipient], claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id) }));
   assert.equal(await tokenBalance(info, recipient.publicKey), 9_950_000n - 49_750n);
+  // The event reports what left the vault (the token's own fee is then withheld on the way in)
+  const [claimed] = parseEvents((await connection.getTransaction(claim, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }))!.meta!.logMessages!);
+  assert.equal(claimed.name, 'TransferClaimed');
+  assert.equal((claimed as { amount: bigint }).amount, 9_950_000n);
 });
 
 test("a percentage fee on tokens needs the treasury's token account", async () => {

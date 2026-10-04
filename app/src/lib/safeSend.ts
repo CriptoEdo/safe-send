@@ -274,6 +274,39 @@ export const incomingTransfers = (connection: Connection, wallet: PublicKey) => 
 // Transfers this wallet sent that are not verified yet (it can still cancel them).
 export const outgoingTransfers = (connection: Connection, wallet: PublicKey) => transfersBy(connection, SENDER_OFFSET, wallet);
 
+// --- Events ---
+
+// The program's events (Anchor `emit!`), read from a transaction's logs ("Program data: <base64>").
+export type SafeSendEvent =
+  | { name: 'TransferSent'; escrow: PublicKey; sender: PublicKey; recipient: PublicKey; mint: PublicKey; amount: bigint; fee: bigint; flatFeeLamports: bigint }
+  | { name: 'TransferClaimed' | 'TransferCancelled'; escrow: PublicKey; sender: PublicKey; recipient: PublicKey; mint: PublicKey; amount: bigint }
+  | { name: 'ConfigUpdated'; admin: PublicKey; treasury: PublicKey; feeBps: number; flatFeeLamports: bigint };
+
+const EVENTS = ['TransferSent', 'TransferClaimed', 'TransferCancelled', 'ConfigUpdated'] as const;
+const EVENT_DISCRIMINATORS = EVENTS.map((name) => ({ name, bytes: discriminator(`event:${name}`) }));
+
+export function parseEvents(logs: string[]): SafeSendEvent[] {
+  const events: SafeSendEvent[] = [];
+  for (const line of logs) {
+    if (!line.startsWith('Program data: ')) continue;
+    const bytes = Buffer.from(line.slice('Program data: '.length), 'base64');
+    const kind = EVENT_DISCRIMINATORS.find((e) => e.bytes.every((b, i) => bytes[i] === b));
+    if (!kind) continue;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const key = (offset: number) => new PublicKey(bytes.subarray(offset, offset + 32));
+    const u64at = (offset: number) => view.getBigUint64(offset, true);
+    if (kind.name === 'ConfigUpdated') {
+      events.push({ name: kind.name, admin: key(8), treasury: key(40), feeBps: view.getUint16(72, true), flatFeeLamports: u64at(74) });
+    } else {
+      const base = { escrow: key(8), sender: key(40), recipient: key(72), mint: key(104), amount: u64at(136) };
+      events.push(kind.name === 'TransferSent'
+        ? { name: kind.name, ...base, fee: u64at(144), flatFeeLamports: u64at(152) }
+        : { name: kind.name, ...base });
+    }
+  }
+  return events;
+}
+
 // --- Recipient fee check ---
 
 // Lamports the recipient needs to verify, on top of the minimum balance a Solana account must keep
