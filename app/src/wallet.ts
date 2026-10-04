@@ -36,8 +36,28 @@ function saveWallets(list: string[]): void {
   try { localStorage.setItem(WALLETS_KEY, JSON.stringify(list)); } catch { /* storage unavailable */ }
 }
 
+// Wallets disconnected one by one: Phantom keeps trusting them (it can only revoke the site for all accounts at
+// once), so Safe Send ignores them until they are connected again with a signature.
+const DISCONNECTED_KEY = 'safe-send:disconnected';
+
+function disconnectedWallets(): string[] {
+  try {
+    const list = JSON.parse(localStorage.getItem(DISCONNECTED_KEY) ?? '[]');
+    return Array.isArray(list) ? list.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDisconnected(list: string[]): void {
+  try { localStorage.setItem(DISCONNECTED_KEY, JSON.stringify(list)); } catch { /* storage unavailable */ }
+}
+
+export const isDisconnected = (wallet: string) => disconnectedWallets().includes(wallet);
+
 export function rememberWallet(wallet: string): void {
   if (!connectedWallets().includes(wallet)) saveWallets([...connectedWallets(), wallet]);
+  if (isDisconnected(wallet)) saveDisconnected(disconnectedWallets().filter((w) => w !== wallet));
 }
 
 // The account currently selected in Phantom, without any popup (null if this site is not connected).
@@ -70,7 +90,7 @@ export async function connectWithSignature(): Promise<PublicKey | null> {
       'Signing is free and moves no funds.',
     ].join('\n');
     await provider.signMessage(new TextEncoder().encode(message), 'utf8');
-    saveWallets([...connectedWallets().filter((w) => w !== wallet.toBase58()), wallet.toBase58()]);
+    rememberWallet(wallet.toBase58());
     return wallet;
   } catch {
     if (connectedWallets().length === 0) await provider.disconnect().catch(() => {});
@@ -93,9 +113,16 @@ export async function approveAccount(): Promise<PublicKey | null> {
   }
 }
 
-// Disconnects Safe Send: forgets the wallets and revokes the site in Phantom.
-export async function disconnectAll(): Promise<void> {
-  saveWallets([]);
+// Disconnects one wallet; the other connected wallets stay. Disconnecting the last one also revokes the site
+// in Phantom. The list is updated before the first await, so callers can render right away.
+export async function disconnectWallet(wallet: string): Promise<void> {
+  const remaining = connectedWallets().filter((w) => w !== wallet);
+  saveWallets(remaining);
+  if (remaining.length > 0) {
+    saveDisconnected([...disconnectedWallets().filter((w) => w !== wallet), wallet]);
+    return;
+  }
+  saveDisconnected([]);
   await phantom()?.disconnect().catch(() => {});
 }
 
