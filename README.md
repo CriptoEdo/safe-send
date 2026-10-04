@@ -6,7 +6,7 @@ A normal transfer to a mistyped address is lost forever. With Safe Send the fund
 
 - **Network:** Solana **Devnet**
 - **Program:** [`EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg`](https://explorer.solana.com/address/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg?cluster=devnet)
-- **Assets:** SOL and any SPL token (Token program)
+- **Assets:** SOL and any token of the SPL Token program or Token-2022 (except tokens with a transfer hook)
 
 ## How it works
 
@@ -79,5 +79,5 @@ solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe
 ## Limits
 
 - The top-up for the recipient's fee is not refundable if the address is wrong (it is ~0.0009 SOL). A relayer that pays the claim fee and gets reimbursed from the escrow would avoid it.
-- Token-2022 mints are not supported yet (only the classic Token program).
+- Token-2022: transfer-fee tokens are supported (the escrow records what reached the vault; the fee withheld in the vault is harvested to the mint so it can close, which needs the mint writable in claim/cancel). Tokens with a transfer hook are refused at send time, since a hook (even one set later) could block the release. With a permanent delegate the issuer can move tokens out of the vault; the release moves whatever is left. Tokens that cannot be deposited (non-transferable, frozen by default) fail the send as a whole.
 - Transfers have no expiry: the sender cancels by hand.

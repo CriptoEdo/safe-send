@@ -2,7 +2,9 @@ import {
   ComputeBudgetProgram, PublicKey, SystemProgram, TransactionInstruction, type Connection, type AccountInfo,
 } from '@solana/web3.js';
 import {
-  ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync,
+  ASSOCIATED_TOKEN_PROGRAM_ID, ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, getExtensionTypes,
+  getTransferFeeConfig, getTransferHook, unpackMint,
 } from '@solana/spl-token';
 import { sha256 } from '@noble/hashes/sha256';
 
@@ -71,34 +73,91 @@ export function cancelSolIx(p: { sender: PublicKey; escrow: PublicKey }) {
   return ix([w(p.sender, true), w(p.escrow)], data(IX.cancelSol));
 }
 
-// --- SPL tokens ---
+// --- Tokens (SPL Token and Token-2022) ---
+
+// What the client needs to know about a mint: its token program, decimals and the Token-2022 extensions that
+// change how a transfer behaves.
+export interface MintInfo {
+  mint: PublicKey;
+  tokenProgram: PublicKey; // TOKEN_PROGRAM_ID or TOKEN_2022_PROGRAM_ID
+  decimals: number;
+  // Transfer fee in basis points and its cap (base units), if the token charges one on every transfer.
+  transferFee: { basisPoints: number; maximum: bigint } | null;
+  // Refused by the program: a hook program could block the release of an escrow.
+  transferHook: boolean;
+  // The issuer can move tokens out of any account, including the escrow.
+  permanentDelegate: boolean;
+}
+
+export async function mintInfos(connection: Connection, mints: PublicKey[]): Promise<Map<string, MintInfo>> {
+  const unique = [...new Map(mints.map((m) => [m.toBase58(), m])).values()];
+  const out = new Map<string, MintInfo>();
+  for (let i = 0; i < unique.length; i += 100) {
+    const batch = unique.slice(i, i + 100);
+    const accounts = await connection.getMultipleAccountsInfo(batch);
+    batch.forEach((mint, j) => {
+      const account = accounts[j];
+      if (!account) throw new Error(`Mint ${mint.toBase58()} not found`);
+      const tokenProgram = account.owner;
+      const state = unpackMint(mint, account, tokenProgram);
+      const extensions = tokenProgram.equals(TOKEN_2022_PROGRAM_ID) ? getExtensionTypes(state.tlvData) : [];
+      const fee = getTransferFeeConfig(state);
+      const hook = getTransferHook(state);
+      // The newer fee applies from its epoch on; the higher of the two is the safe one to show.
+      const feeConfig = fee && (fee.newerTransferFee.transferFeeBasisPoints >= fee.olderTransferFee.transferFeeBasisPoints
+        ? fee.newerTransferFee : fee.olderTransferFee);
+      out.set(mint.toBase58(), {
+        mint,
+        tokenProgram,
+        decimals: state.decimals,
+        transferFee: feeConfig && (feeConfig.transferFeeBasisPoints > 0)
+          ? { basisPoints: feeConfig.transferFeeBasisPoints, maximum: feeConfig.maximumFee } : null,
+        transferHook: !!hook && (!hook.programId.equals(PublicKey.default) || !hook.authority.equals(PublicKey.default)),
+        permanentDelegate: extensions.includes(ExtensionType.PermanentDelegate),
+      });
+    });
+  }
+  return out;
+}
+
+// The fee a token with a transfer fee withholds from one transfer of `amount` (Token-2022 rounds up).
+export function transferFeeOf(info: MintInfo, amount: bigint): bigint {
+  if (!info.transferFee) return 0n;
+  const fee = (amount * BigInt(info.transferFee.basisPoints) + 9_999n) / 10_000n;
+  return fee > info.transferFee.maximum ? info.transferFee.maximum : fee;
+}
+
+const tokenAccount = (mint: MintInfo, owner: PublicKey) => getAssociatedTokenAddressSync(mint.mint, owner, true, mint.tokenProgram);
+// The mint is written only when withheld transfer fees are harvested to it on release.
+const releaseMint = (mint: MintInfo) => (mint.transferFee ? w(mint.mint) : r(mint.mint));
 
 // Two instructions: create the recipient's token account if missing (paid by the sender, so verifying only
 // costs the recipient the fee), then lock the tokens.
-export function sendTokenIxs(p: { sender: PublicKey; recipient: PublicKey; mint: PublicKey; senderToken: PublicKey; id: bigint; amount: bigint }) {
+export function sendTokenIxs(p: { sender: PublicKey; recipient: PublicKey; mint: MintInfo; senderToken: PublicKey; id: bigint; amount: bigint }) {
   const escrow = escrowAddress(p.sender, p.id);
   return [
-    createAssociatedTokenAccountIdempotentInstruction(p.sender, getAssociatedTokenAddressSync(p.mint, p.recipient, true), p.recipient, p.mint),
+    createAssociatedTokenAccountIdempotentInstruction(
+      p.sender, tokenAccount(p.mint, p.recipient), p.recipient, p.mint.mint, p.mint.tokenProgram),
     ix([
-      w(p.sender, true), r(p.recipient), r(p.mint), w(p.senderToken), w(escrow), w(vaultAddress(escrow)),
-      r(TOKEN_PROGRAM_ID), r(SystemProgram.programId),
+      w(p.sender, true), r(p.recipient), r(p.mint.mint), w(p.senderToken), w(escrow), w(vaultAddress(escrow)),
+      r(p.mint.tokenProgram), r(SystemProgram.programId),
     ], data(IX.sendToken, u64(p.id), u64(p.amount))),
   ];
 }
 
-export function claimTokenIx(p: { recipient: PublicKey; sender: PublicKey; mint: PublicKey; escrow: PublicKey }) {
+export function claimTokenIx(p: { recipient: PublicKey; sender: PublicKey; mint: MintInfo; escrow: PublicKey }) {
   return ix([
-    w(p.recipient, true), w(p.sender), r(p.mint), w(getAssociatedTokenAddressSync(p.mint, p.recipient, true)),
+    w(p.recipient, true), w(p.sender), releaseMint(p.mint), w(tokenAccount(p.mint, p.recipient)),
     w(p.escrow), w(vaultAddress(p.escrow)),
-    r(TOKEN_PROGRAM_ID), r(ASSOCIATED_TOKEN_PROGRAM_ID), r(SystemProgram.programId),
+    r(p.mint.tokenProgram), r(ASSOCIATED_TOKEN_PROGRAM_ID), r(SystemProgram.programId),
   ], data(IX.claimToken));
 }
 
-export function cancelTokenIx(p: { sender: PublicKey; mint: PublicKey; escrow: PublicKey }) {
+export function cancelTokenIx(p: { sender: PublicKey; mint: MintInfo; escrow: PublicKey }) {
   return ix([
-    w(p.sender, true), r(p.mint), w(getAssociatedTokenAddressSync(p.mint, p.sender, true)),
+    w(p.sender, true), releaseMint(p.mint), w(tokenAccount(p.mint, p.sender)),
     w(p.escrow), w(vaultAddress(p.escrow)),
-    r(TOKEN_PROGRAM_ID), r(ASSOCIATED_TOKEN_PROGRAM_ID), r(SystemProgram.programId),
+    r(p.mint.tokenProgram), r(ASSOCIATED_TOKEN_PROGRAM_ID), r(SystemProgram.programId),
   ], data(IX.cancelToken));
 }
 

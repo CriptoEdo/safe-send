@@ -2,8 +2,11 @@
 // accountChanged with null for untrusted accounts) but signs with test keypairs kept in localStorage, so the
 // app runs real transactions against a local validator. Never use it with real funds.
 import '../../src/polyfills.ts';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, type Transaction } from '@solana/web3.js';
-import { createMint, getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import {
+  ExtensionType, TOKEN_2022_PROGRAM_ID, createInitializeMintInstruction, createInitializeTransferFeeConfigInstruction,
+  createInitializeTransferHookInstruction, createMint, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
+} from '@solana/spl-token';
 
 const load = <T>(key: string, fallback: T): T => JSON.parse(localStorage.getItem(`harness:${key}`) ?? 'null') ?? fallback;
 const save = (key: string, value: unknown) => localStorage.setItem(`harness:${key}`, JSON.stringify(value));
@@ -90,6 +93,27 @@ const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
     const ata = await getOrCreateAssociatedTokenAccount(connection, payer, mint, payer.publicKey);
     await mintTo(connection, payer, mint, ata.address, payer, BigInt(amount) * 1_000_000n);
     return mint.toBase58();
+  },
+  // A Token-2022 mint with `amount` (whole tokens, 6 decimals) in account `i`, with a transfer fee in basis
+  // points or a transfer hook.
+  async mintToken2022(i: number, amount: number, extension: { feeBasisPoints: number } | { hook: true }) {
+    const payer = keys()[i];
+    const mintKey = Keypair.generate();
+    const types = 'hook' in extension ? [ExtensionType.TransferHook] : [ExtensionType.TransferFeeConfig];
+    const space = getMintLen(types);
+    await sendAndConfirmTransaction(connection, new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey, newAccountPubkey: mintKey.publicKey, space,
+        lamports: await connection.getMinimumBalanceForRentExemption(space), programId: TOKEN_2022_PROGRAM_ID,
+      }),
+      'hook' in extension
+        ? createInitializeTransferHookInstruction(mintKey.publicKey, payer.publicKey, Keypair.generate().publicKey, TOKEN_2022_PROGRAM_ID)
+        : createInitializeTransferFeeConfigInstruction(mintKey.publicKey, payer.publicKey, payer.publicKey, extension.feeBasisPoints, 10n ** 18n, TOKEN_2022_PROGRAM_ID),
+      createInitializeMintInstruction(mintKey.publicKey, 6, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
+    ), [payer, mintKey], { commitment: 'confirmed' });
+    const ata = await getOrCreateAssociatedTokenAccount(connection, payer, mintKey.publicKey, payer.publicKey, false, 'confirmed', undefined, TOKEN_2022_PROGRAM_ID);
+    await mintTo(connection, payer, mintKey.publicKey, ata.address, payer, BigInt(amount) * 1_000_000n, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
+    return mintKey.publicKey.toBase58();
   },
   async tokenBalance(i: number, mint: string) {
     const res = await connection.getParsedTokenAccountsByOwner(keys()[i].publicKey, { mint: new PublicKey(mint) });

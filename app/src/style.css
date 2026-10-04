@@ -99,6 +99,9 @@ a:hover { text-decoration: underline; }
 .amount-input::placeholder { color: var(--line); }
 .asset { margin-top: 6px; border: 0; border-radius: 999px; padding: 7px 14px; background: var(--field); color: var(--fg); font: inherit; font-weight: 700; cursor: pointer; }
 .balance { margin-top: 8px; font-size: 13px; color: var(--muted); }
+.token-note { margin: 8px 4px 0; padding: 9px 12px; border-radius: 12px; font-size: 13px; background: var(--warn-bg); color: var(--warn); }
+.token-note:empty { display: none; }
+.token-note .error { color: var(--error); }
 
 .field { display: flex; align-items: center; gap: 12px; padding: 4px 6px 4px 18px; background: var(--field); border-radius: 18px; }
 .field span { font-weight: 700; color: var(--muted); }

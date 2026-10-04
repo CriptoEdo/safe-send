@@ -4,12 +4,19 @@
 import assert from 'node:assert/strict';
 import { before, test } from 'node:test';
 import {
-  Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, sendAndConfirmTransaction,
+  Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction,
 } from '@solana/web3.js';
-import { createMint, getAccount, getAssociatedTokenAddressSync, getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
+import {
+  AccountState, ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, createInitializeDefaultAccountStateInstruction,
+  createInitializeMintInstruction, createInitializeNonTransferableMintInstruction, createInitializePermanentDelegateInstruction,
+  createInitializeTransferFeeConfigInstruction, createInitializeTransferHookInstruction, createMint, freezeAccount, getAccount,
+  getAssociatedTokenAddressSync, getMint, getMintLen, getOrCreateAssociatedTokenAccount, getTransferFeeConfig, mintTo,
+  thawAccount, transferChecked,
+} from '@solana/spl-token';
 import {
   CLAIM_FEE_LAMPORTS, ESCROW_RESERVED, ESCROW_SIZE, cancelSolIx, claimFeeIxs, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress,
-  incomingTransfers, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, vaultAddress,
+  incomingTransfers, mintInfos, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf, vaultAddress,
+  type MintInfo,
 } from '../src/lib/safeSend.ts';
 
 const connection = new Connection(process.env.TEST_RPC ?? 'http://127.0.0.1:8899', 'confirmed');
@@ -131,50 +138,194 @@ test('invalid transfers are refused: to yourself, or of zero', async () => {
   await rejects(run(sender, sendSolIx({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, id: newTransferId(), lamports: 0n })), /greater than zero/);
 });
 
-test('SPL token: the recipient account is created by the sender, tokens wait in the vault, verify moves them', async () => {
-  const mint = await createMint(connection, sender, sender.publicKey, null, 6);
-  const senderToken = await getOrCreateAssociatedTokenAccount(connection, sender, mint, sender.publicKey);
-  await mintTo(connection, sender, mint, senderToken.address, sender, 1_000_000_000n);
+// A mint of `tokenProgram` with `supply` tokens in the sender's token account. For Token-2022, `extensions`
+// add their init instructions (they run before InitializeMint, as Token-2022 requires).
+async function tokenWithBalance(p: {
+  tokenProgram: PublicKey; decimals?: number; supply: bigint;
+  extensions?: { types: ExtensionType[]; init: (mint: PublicKey) => ReturnType<typeof createInitializeMintInstruction>[] };
+  freezeAuthority?: PublicKey;
+}): Promise<{ info: MintInfo; senderToken: PublicKey }> {
+  const decimals = p.decimals ?? 6;
+  let mint: PublicKey;
+  if (p.extensions) {
+    const kp = Keypair.generate();
+    mint = kp.publicKey;
+    const space = getMintLen(p.extensions.types);
+    await sendAndConfirmTransaction(connection, new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: sender.publicKey, newAccountPubkey: mint, space,
+        lamports: await connection.getMinimumBalanceForRentExemption(space), programId: p.tokenProgram,
+      }),
+      ...p.extensions.init(mint),
+      createInitializeMintInstruction(mint, decimals, sender.publicKey, p.freezeAuthority ?? null, p.tokenProgram),
+    ), [sender, kp], { commitment: 'confirmed' });
+  } else {
+    mint = await createMint(connection, sender, sender.publicKey, p.freezeAuthority ?? null, decimals, undefined, { commitment: 'confirmed' }, p.tokenProgram);
+  }
+  const senderToken = (await getOrCreateAssociatedTokenAccount(connection, sender, mint, sender.publicKey, false, 'confirmed', undefined, p.tokenProgram)).address;
+  if (p.extensions?.types.includes(ExtensionType.DefaultAccountState)) {
+    await thawAccount(connection, sender, senderToken, mint, sender, [], { commitment: 'confirmed' }, p.tokenProgram);
+  }
+  await mintTo(connection, sender, mint, senderToken, sender, p.supply, [], { commitment: 'confirmed' }, p.tokenProgram);
+  const info = (await mintInfos(connection, [mint])).get(mint.toBase58())!;
+  return { info, senderToken };
+}
 
+const tokenBalance = async (info: MintInfo, account: PublicKey) => (await getAccount(connection, account, 'confirmed', info.tokenProgram)).amount;
+const ata = (info: MintInfo, owner: PublicKey) => getAssociatedTokenAddressSync(info.mint, owner, true, info.tokenProgram);
+const escrowOf = async (escrow: PublicKey) => (await outgoingTransfers(connection, sender.publicKey)).find((t) => t.address.equals(escrow));
+
+for (const [name, tokenProgram] of [['SPL Token', TOKEN_PROGRAM_ID], ['Token-2022', TOKEN_2022_PROGRAM_ID]] as const) {
+  test(`${name}: the recipient account is created by the sender, tokens wait in the vault, verify moves them`, async () => {
+    const { info, senderToken } = await tokenWithBalance({ tokenProgram, supply: 1_000_000_000n });
+    assert.ok(info.tokenProgram.equals(tokenProgram));
+
+    const recipient = await funded(1);
+    const id = newTransferId();
+    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 250_000_000n }));
+    const escrow = escrowAddress(sender.publicKey, id);
+    assert.equal(await tokenBalance(info, vaultAddress(escrow)), 250_000_000n);
+    assert.equal(await tokenBalance(info, ata(info, recipient.publicKey)), 0n); // created, still empty
+    assert.equal((await escrowOf(escrow))!.amount, 250_000_000n);
+
+    const [incoming] = await incomingTransfers(connection, recipient.publicKey);
+    assert.ok(incoming.mint.equals(info.mint));
+    assert.equal(incoming.isSol, false);
+
+    await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow }));
+    assert.equal(await tokenBalance(info, ata(info, recipient.publicKey)), 250_000_000n);
+    assert.equal(await connection.getAccountInfo(vaultAddress(escrow)), null);
+    assert.equal(await connection.getAccountInfo(escrow), null);
+
+    // Cancel path: the tokens come back to the sender
+    const id2 = newTransferId();
+    const before = await tokenBalance(info, senderToken);
+    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
+    await run(sender, cancelTokenIx({ sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id2) }));
+    assert.equal(await tokenBalance(info, senderToken), before);
+    assert.equal(await connection.getAccountInfo(vaultAddress(escrowAddress(sender.publicKey, id2))), null);
+  });
+
+  test(`${name}: a token transfer cannot be verified as SOL, nor by the wrong wallet`, async () => {
+    const { info, senderToken } = await tokenWithBalance({ tokenProgram, decimals: 0, supply: 10n });
+    const recipient = await funded(1);
+    const id = newTransferId();
+    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 5n }));
+    const escrow = escrowAddress(sender.publicKey, id);
+    await rejects(run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow })), /different asset/);
+    const stranger = await funded(1);
+    await rejects(run(stranger, claimTokenIx({ recipient: stranger.publicKey, sender: sender.publicKey, mint: info, escrow })), /Only the recipient can verify/);
+    await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow }));
+  });
+}
+
+test('Token-2022 transfer fee: the escrow records what arrived, the withheld fee is harvested so the vault closes', async () => {
+  const transferFee = (mint: PublicKey) => [createInitializeTransferFeeConfigInstruction(
+    mint, sender.publicKey, sender.publicKey, 100, 1_000_000_000n, TOKEN_2022_PROGRAM_ID)]; // 1%
+  const { info, senderToken } = await tokenWithBalance({
+    tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 10_000_000n,
+    extensions: { types: [ExtensionType.TransferFeeConfig], init: transferFee },
+  });
+  assert.deepEqual(info.transferFee, { basisPoints: 100, maximum: 1_000_000_000n });
+  assert.equal(transferFeeOf(info, 1_000_000n), 10_000n);
+
+  // Claim
   const recipient = await funded(1);
   const id = newTransferId();
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint, senderToken: senderToken.address, id, amount: 250_000_000n }));
+  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 1_000_000n }));
   const escrow = escrowAddress(sender.publicKey, id);
-  const recipientToken = getAssociatedTokenAddressSync(mint, recipient.publicKey);
-  assert.equal((await getAccount(connection, vaultAddress(escrow))).amount, 250_000_000n);
-  assert.equal((await getAccount(connection, recipientToken)).amount, 0n); // created, still empty
-
-  const [incoming] = await incomingTransfers(connection, recipient.publicKey);
-  assert.ok(incoming.mint.equals(mint));
-  assert.equal(incoming.isSol, false);
-
-  await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint, escrow }));
-  assert.equal((await getAccount(connection, recipientToken)).amount, 250_000_000n);
+  assert.equal((await escrowOf(escrow))!.amount, 990_000n); // 1% withheld on the way in
+  // Without the mint writable the withheld fee cannot be harvested: the claim fails as a whole (nothing moves)
+  const readOnlyMint = claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: { ...info, transferFee: null }, escrow });
+  await rejects(run(recipient, readOnlyMint), /writable privilege escalated|privilege escalated/i);
+  assert.equal(await tokenBalance(info, vaultAddress(escrow)), 990_000n);
+  await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow }));
+  // 1% withheld again on the way out (the recipient's account holds it until the issuer collects it)
+  const received = await getAccount(connection, ata(info, recipient.publicKey), 'confirmed', TOKEN_2022_PROGRAM_ID);
+  assert.equal(received.amount, 990_000n - 9_900n);
   assert.equal(await connection.getAccountInfo(vaultAddress(escrow)), null);
   assert.equal(await connection.getAccountInfo(escrow), null);
+  // The vault's withheld fee went to the mint
+  const mint = await getMint(connection, info.mint, 'confirmed', TOKEN_2022_PROGRAM_ID);
+  assert.equal(getTransferFeeConfig(mint)!.withheldAmount, 10_000n);
 
-  // Cancel path: the tokens come back to the sender
+  // Cancel
   const id2 = newTransferId();
-  const before = (await getAccount(connection, senderToken.address)).amount;
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint, senderToken: senderToken.address, id: id2, amount: 1_000_000n }));
-  await run(sender, cancelTokenIx({ sender: sender.publicKey, mint, escrow: escrowAddress(sender.publicKey, id2) }));
-  assert.equal((await getAccount(connection, senderToken.address)).amount, before);
+  const before = await tokenBalance(info, senderToken);
+  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id: id2, amount: 1_000_000n }));
+  await run(sender, cancelTokenIx({ sender: sender.publicKey, mint: info, escrow: escrowAddress(sender.publicKey, id2) }));
+  assert.equal(await tokenBalance(info, senderToken), before - 1_000_000n + 990_000n - 9_900n);
+  assert.equal(await connection.getAccountInfo(vaultAddress(escrowAddress(sender.publicKey, id2))), null);
 });
 
-test('a token transfer cannot be verified as SOL, nor by the wrong wallet', async () => {
-  const mint = await createMint(connection, sender, sender.publicKey, null, 0);
-  const senderToken = await getOrCreateAssociatedTokenAccount(connection, sender, mint, sender.publicKey);
-  await mintTo(connection, sender, mint, senderToken.address, sender, 10n);
+test('Token-2022 transfer hook: refused at send time (a hook could block the release), nothing is locked', async () => {
+  const withHook = (program: PublicKey) => (mint: PublicKey) => [createInitializeTransferHookInstruction(mint, sender.publicKey, program, TOKEN_2022_PROGRAM_ID)];
+  for (const program of [Keypair.generate().publicKey, PublicKey.default]) { // a hook now, or one the authority can set later
+    const { info, senderToken } = await tokenWithBalance({
+      tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 100n, decimals: 0,
+      extensions: { types: [ExtensionType.TransferHook], init: withHook(program) },
+    });
+    assert.equal(info.transferHook, true);
+    const id = newTransferId();
+    await rejects(run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /transfer hook are not supported/);
+    assert.equal(await tokenBalance(info, senderToken), 100n);
+    assert.equal(await connection.getAccountInfo(escrowAddress(sender.publicKey, id)), null);
+  }
+});
+
+test('Token-2022 permanent delegate: if the issuer moves tokens out of the vault, claim and cancel still work', async () => {
+  const delegate = (mint: PublicKey) => [createInitializePermanentDelegateInstruction(mint, sender.publicKey, TOKEN_2022_PROGRAM_ID)];
+  const { info, senderToken } = await tokenWithBalance({
+    tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 1_000n, decimals: 0,
+    extensions: { types: [ExtensionType.PermanentDelegate], init: delegate },
+  });
+  assert.equal(info.permanentDelegate, true);
+  const recipient = await funded(1);
+  for (const [taken, release] of [[400n, 'claim'], [600n, 'cancel']] as const) {
+    const id = newTransferId();
+    await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 600n }));
+    const escrow = escrowAddress(sender.publicKey, id);
+    // The delegate (here the sender, as issuer) takes some or all of the vault
+    await transferChecked(connection, sender, vaultAddress(escrow), info.mint, senderToken, sender, taken, 0, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
+    const before = release === 'claim' ? await tokenBalance(info, ata(info, recipient.publicKey)) : await tokenBalance(info, senderToken);
+    if (release === 'claim') await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow }));
+    else await run(sender, cancelTokenIx({ sender: sender.publicKey, mint: info, escrow }));
+    const after = release === 'claim' ? await tokenBalance(info, ata(info, recipient.publicKey)) : await tokenBalance(info, senderToken);
+    assert.equal(after - before, 600n - taken);
+    assert.equal(await connection.getAccountInfo(vaultAddress(escrow)), null);
+    assert.equal(await connection.getAccountInfo(escrow), null);
+  }
+});
+
+test('Token-2022 tokens that cannot be deposited fail the send as a whole: non-transferable, frozen by default', async () => {
+  const nonTransferable = await tokenWithBalance({
+    tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 100n, decimals: 0,
+    extensions: { types: [ExtensionType.NonTransferable], init: (mint) => [createInitializeNonTransferableMintInstruction(mint, TOKEN_2022_PROGRAM_ID)] },
+  });
+  const frozen = await tokenWithBalance({
+    tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 100n, decimals: 0, freezeAuthority: sender.publicKey,
+    extensions: { types: [ExtensionType.DefaultAccountState], init: (mint) => [createInitializeDefaultAccountStateInstruction(mint, AccountState.Frozen, TOKEN_2022_PROGRAM_ID)] },
+  });
+  for (const { info, senderToken } of [nonTransferable, frozen]) {
+    const id = newTransferId();
+    await rejects(run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: Keypair.generate().publicKey, mint: info, senderToken, id, amount: 10n })), /Transfer is disabled for this mint|Account is frozen/);
+    assert.equal(await tokenBalance(info, senderToken), 100n);
+    assert.equal(await connection.getAccountInfo(escrowAddress(sender.publicKey, id)), null);
+  }
+});
+
+test('a vault frozen by the issuer blocks the claim only until it is thawed', async () => {
+  const { info, senderToken } = await tokenWithBalance({ tokenProgram: TOKEN_2022_PROGRAM_ID, supply: 100n, decimals: 0, freezeAuthority: sender.publicKey });
   const recipient = await funded(1);
   const id = newTransferId();
-  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint, senderToken: senderToken.address, id, amount: 5n }));
+  await run(sender, ...sendTokenIxs({ sender: sender.publicKey, recipient: recipient.publicKey, mint: info, senderToken, id, amount: 40n }));
   const escrow = escrowAddress(sender.publicKey, id);
-  await rejects(run(recipient, claimSolIx({ recipient: recipient.publicKey, sender: sender.publicKey, escrow })), /different asset/);
-  const stranger = await funded(1);
-  await rejects(run(stranger, claimTokenIx({ recipient: stranger.publicKey, sender: sender.publicKey, mint, escrow })), /Only the recipient can verify/);
-  await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint, escrow }));
+  await freezeAccount(connection, sender, vaultAddress(escrow), info.mint, sender, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
+  await rejects(run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow })), /Account is frozen/);
+  await thawAccount(connection, sender, vaultAddress(escrow), info.mint, sender, [], { commitment: 'confirmed' }, TOKEN_2022_PROGRAM_ID);
+  await run(recipient, claimTokenIx({ recipient: recipient.publicKey, sender: sender.publicKey, mint: info, escrow }));
+  assert.equal(await tokenBalance(info, ata(info, recipient.publicKey)), 40n);
 });
-
 
 test('escrow layout: version 1 and zeroed reserved bytes, so future fields fit without resizing', async () => {
   const recipient = Keypair.generate();

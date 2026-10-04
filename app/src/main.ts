@@ -1,10 +1,11 @@
 import './polyfills.ts';
 import './style.css';
 import { Connection, PublicKey, SendTransactionError, Transaction } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, getMint } from '@solana/spl-token';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimFeeIxs, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
-  newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, type FeeCheck, type PendingTransfer,
+  mintInfos, newTransferId, outgoingTransfers, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
+  type FeeCheck, type MintInfo, type PendingTransfer,
 } from './lib/safeSend.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
@@ -74,16 +75,17 @@ function parseUnits(text: string, decimals: number): bigint | null {
 
 const sol = (lamports: number | bigint) => units(BigInt(lamports), 9);
 
-// Mint decimals, loaded with the transfers so rendering never waits for the network.
-const decimalsCache = new Map<string, number>();
-async function loadDecimals(mints: PublicKey[]): Promise<void> {
-  const missing = [...new Set(mints.map((m) => m.toBase58()))].filter((m) => !decimalsCache.has(m));
-  await Promise.all(missing.map(async (m) => decimalsCache.set(m, (await getMint(connection, new PublicKey(m))).decimals)));
+// Mints (token program, decimals, Token-2022 extensions), loaded with the wallet's data so rendering never
+// waits for the network.
+const mintCache = new Map<string, MintInfo>();
+async function loadMints(mints: PublicKey[]): Promise<void> {
+  const missing = mints.filter((m) => !mintCache.has(m.toBase58()));
+  if (missing.length) (await mintInfos(connection, missing)).forEach((info, key) => mintCache.set(key, info));
 }
 
 function amountLabel(t: PendingTransfer): string {
   if (t.isSol) return `${sol(t.amount)} SOL`;
-  return `${units(t.amount, decimalsCache.get(t.mint.toBase58()) ?? 0)} <span class="mint" title="${t.mint.toBase58()}">${short(t.mint)}</span>`;
+  return `${units(t.amount, mintCache.get(t.mint.toBase58())?.decimals ?? 0)} <span class="mint" title="${t.mint.toBase58()}">${short(t.mint)}</span>`;
 }
 
 // Program errors (Anchor custom errors start at 6000) and wallet rejections, in plain words.
@@ -155,25 +157,30 @@ async function load(owner: PublicKey): Promise<void> {
   lastRefresh = Date.now();
   const current = () => seq === refreshSeq && state.wallet?.equals(owner);
   try {
-    const [lamports, parsed, incoming, outgoing] = await Promise.all([
+    const [lamports, classic, token2022, incoming, outgoing] = await Promise.all([
       retry(() => connection.getBalance(owner)),
       retry(() => connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID })),
+      retry(() => connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID })),
       retry(() => incomingTransfers(connection, owner)),
       retry(() => outgoingTransfers(connection, owner)),
     ]);
-    await retry(() => loadDecimals([...incoming, ...outgoing].filter((t) => !t.isSol).map((t) => t.mint)));
+    // One entry per mint (the account with the most tokens, if the wallet has several).
+    const holdings = new Map<string, TokenHolding>();
+    for (const { pubkey, account } of [...classic.value, ...token2022.value]) {
+      const info = account.data.parsed.info;
+      const holding = { mint: new PublicKey(info.mint), account: pubkey, amount: BigInt(info.tokenAmount.amount), decimals: info.tokenAmount.decimals };
+      const known = holdings.get(info.mint);
+      if (holding.amount > 0n && (!known || holding.amount > known.amount)) holdings.set(info.mint, holding);
+    }
+    const tokens = [...holdings.values()];
+    await retry(() => loadMints([...tokens.map((t) => t.mint), ...[...incoming, ...outgoing].filter((t) => !t.isSol).map((t) => t.mint)]));
     if (!current()) return;
     const open = (t: PendingTransfer) => !closed.has(t.address.toBase58());
     Object.assign(state, {
       loaded: true,
       loadError: false,
       sol: lamports,
-      tokens: parsed.value
-        .map(({ pubkey, account }) => {
-          const info = account.data.parsed.info;
-          return { mint: new PublicKey(info.mint), account: pubkey, amount: BigInt(info.tokenAmount.amount), decimals: info.tokenAmount.decimals };
-        })
-        .filter((t) => t.amount > 0n),
+      tokens,
       incoming: incoming.filter(open).sort((a, b) => b.createdAt - a.createdAt),
       outgoing: outgoing.filter(open).sort((a, b) => b.createdAt - a.createdAt),
     });
@@ -203,6 +210,7 @@ function paint(): void {
     select.innerHTML = assetOptions();
   }
   document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
+  document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
 }
 
 // Replaces one element with fresh HTML and binds the new element's buttons.
@@ -312,6 +320,19 @@ const assetOptions = () => [{ value: 'SOL', label: 'SOL' }]
   .map((o) => `<option value="${o.value}" ${o.value === state.form.asset ? 'selected' : ''}>${o.label}</option>`)
   .join('');
 
+// What to know before sending a Token-2022 token with special rules.
+function tokenNote(asset: string): string {
+  const info = asset === 'SOL' ? undefined : mintCache.get(asset);
+  if (!info) return '';
+  if (info.transferHook) return '<span class="error">This token uses a transfer hook, which Safe Send does not support.</span>';
+  const notes: string[] = [];
+  if (info.transferFee) {
+    notes.push(`This token charges a ${info.transferFee.basisPoints / 100}% fee on every transfer: the escrow receives your amount minus the fee, and the claim (or a cancel) pays it once more.`);
+  }
+  if (info.permanentDelegate) notes.push("This token's issuer can move it from any account, including the escrow.");
+  return notes.join(' ');
+}
+
 const balanceLabel = (asset: string) => {
   if (!state.loaded) return 'Balance …';
   if (asset === 'SOL') return `Balance ${sol(state.sol)} SOL`;
@@ -331,6 +352,7 @@ function sendView(): string {
         <select id="asset" class="asset">${assetOptions()}</select>
         <div id="balance" class="balance">${balanceLabel(state.form.asset)}</div>
       </div>
+      <p id="token-note" class="token-note">${tokenNote(state.form.asset)}</p>
       <label class="field"><span>To</span>
         <input id="recipient" autocomplete="off" spellcheck="false" placeholder="Recipient wallet address" value="${escape(state.form.recipient)}" />
       </label>
@@ -460,15 +482,19 @@ async function send(): Promise<void> {
   const recipient = new PublicKey(state.fee!.recipient);
   const asset = currentAsset();
   const holding = asset === 'SOL' ? null : state.tokens.find((t) => t.mint.toBase58() === asset)!;
+  const mint = holding && mintCache.get(asset);
+  if (holding && !mint) return message('send-result', 'Token details are still loading: try again in a moment.', 'error');
+  if (mint?.transferHook) return message('send-result', 'This token uses a transfer hook, which Safe Send does not support.', 'error');
   const amount = parseUnits(state.form.amount, holding ? holding.decimals : 9);
   if (amount === null) return message('send-result', 'Enter a valid amount, like 0.5.', 'error');
   if (amount <= 0n) return message('send-result', 'Enter an amount greater than zero.', 'error');
   if (holding && amount > holding.amount) return message('send-result', 'You do not have that many tokens.', 'error');
+  if (mint && transferFeeOf(mint, amount) >= amount) return message('send-result', "The token's transfer fee would take the whole amount: send more.", 'error');
 
   const id = newTransferId();
   const tx = new Transaction();
   if (check.topUp) tx.add(topUpIx(sender, recipient, check.topUp));
-  if (holding) tx.add(...sendTokenIxs({ sender, recipient, mint: holding.mint, senderToken: holding.account, id, amount }));
+  if (holding && mint) tx.add(...sendTokenIxs({ sender, recipient, mint, senderToken: holding.account, id, amount }));
   else tx.add(sendSolIx({ sender, recipient, id, lamports: amount }));
 
   state.busy = true;
@@ -508,9 +534,11 @@ async function act(kind: 'claim' | 'cancel', address: string): Promise<void> {
   const t = list.find((x) => x.address.toBase58() === address);
   if (!t) return;
   const me = state.wallet;
+  const mint = t.isSol ? null : mintCache.get(t.mint.toBase58());
+  if (!t.isSol && !mint) return; // loaded with the transfers
   const tx = new Transaction().add(...claimFeeIxs(), kind === 'claim'
-    ? (t.isSol ? claimSolIx({ recipient: me, sender: t.sender, escrow: t.address }) : claimTokenIx({ recipient: me, sender: t.sender, mint: t.mint, escrow: t.address }))
-    : (t.isSol ? cancelSolIx({ sender: me, escrow: t.address }) : cancelTokenIx({ sender: me, mint: t.mint, escrow: t.address })));
+    ? (mint ? claimTokenIx({ recipient: me, sender: t.sender, mint, escrow: t.address }) : claimSolIx({ recipient: me, sender: t.sender, escrow: t.address }))
+    : (mint ? cancelTokenIx({ sender: me, mint, escrow: t.address }) : cancelSolIx({ sender: me, escrow: t.address })));
   state.busy = true;
   const tab = state.tab;
   state.flash = { tab, target: 'list-result', kind: 'info', html: 'Confirm in Phantom…' };
@@ -575,6 +603,7 @@ function bind(root: ParentNode): void {
   on('#asset', (el) => {
     state.form.asset = (el as HTMLSelectElement).value;
     document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
+    document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
   }, 'change');
   on('#recipient', (el) => {
     state.form.recipient = (el as HTMLInputElement).value;

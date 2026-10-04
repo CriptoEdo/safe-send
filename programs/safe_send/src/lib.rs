@@ -7,15 +7,30 @@
 //!
 //! Accounts per transfer:
 //! - escrow: PDA ["escrow", sender, id] with who, what and how much. For SOL it also holds the lamports.
-//! - vault: PDA ["vault", escrow], an SPL token account owned by the escrow (token transfers only).
+//! - vault: PDA ["vault", escrow], a token account owned by the escrow (token transfers only).
 //! Rent for both always goes back to the sender, on claim or cancel.
+//!
+//! Tokens of both the SPL Token program and Token-2022 are supported. Token-2022 extensions that could lock
+//! funds in an escrow are handled:
+//! - transfer fee: the escrow records what actually reached the vault, the release moves the vault's whole
+//!   balance, and the fees withheld in the vault are harvested to the mint (otherwise it could not be closed);
+//! - permanent delegate: the issuer can move tokens out of the vault, so the release moves what is left;
+//! - transfer hook: refused at send time, since a hook program (even one added later) could block the release.
+//! Extensions that make the deposit itself fail (non-transferable, frozen by default, CPI guard) fail the send
+//! transaction as a whole, so nothing gets locked.
 //!
 //! Token instructions box their accounts: Anchor deserializes them on the stack, which is 4 KB in SBF.
 
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token_2022::spl_token_2022;
+use anchor_spl::token_2022::spl_token_2022::extension::{
+    transfer_fee::TransferFeeConfig, transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
+};
+use anchor_spl::token_interface::{
+    self, CloseAccount, HarvestWithheldTokensToMint, Mint, TokenAccount, TokenInterface, TransferChecked,
+};
 
 declare_id!("EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg");
 
@@ -85,22 +100,32 @@ pub mod safe_send {
     /// same transaction (paid by the sender), so verifying later only costs the recipient the transaction fee.
     pub fn send_token(ctx: Context<SendToken>, id: u64, amount: u64) -> Result<()> {
         require!(amount > 0, SafeSendError::ZeroAmount);
-        token::transfer(
+        require!(
+            !token_2022_rules(&ctx.accounts.mint.to_account_info())?.transfer_hook,
+            SafeSendError::UnsupportedToken
+        );
+        token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from: ctx.accounts.sender_token.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
                     to: ctx.accounts.vault.to_account_info(),
                     authority: ctx.accounts.sender.to_account_info(),
                 },
             ),
             amount,
+            ctx.accounts.mint.decimals,
         )?;
+        // With a transfer fee the vault receives less than `amount`: the escrow records what actually arrived.
+        ctx.accounts.vault.reload()?;
+        let received = ctx.accounts.vault.amount;
+        require!(received > 0, SafeSendError::ZeroAmount);
         ctx.accounts.escrow.set_inner(Escrow {
             sender: ctx.accounts.sender.key(),
             recipient: ctx.accounts.recipient.key(),
             mint: ctx.accounts.mint.key(),
-            amount,
+            amount: received,
             id,
             created_at: Clock::get()?.unix_timestamp,
             bump: ctx.bumps.escrow,
@@ -116,6 +141,7 @@ pub mod safe_send {
         release_vault(
             &a.escrow,
             &a.vault,
+            &a.mint,
             &a.recipient_token,
             &a.sender.to_account_info(),
             &a.token_program,
@@ -128,6 +154,7 @@ pub mod safe_send {
         release_vault(
             &a.escrow,
             &a.vault,
+            &a.mint,
             &a.sender_token,
             &a.sender.to_account_info(),
             &a.token_program,
@@ -135,30 +162,73 @@ pub mod safe_send {
     }
 }
 
-// Moves the whole vault to `to` and closes it (rent to `rent_to`), signing as the escrow PDA.
+/// The Token-2022 extensions of a mint that change how an escrow works (all false for SPL Token mints).
+struct Token2022Rules {
+    /// Transfers withhold a fee in the receiving account; it must be harvested before the vault is closed.
+    transfer_fee: bool,
+    /// A hook program runs on every transfer, or can be set later by the hook authority.
+    transfer_hook: bool,
+}
+
+fn token_2022_rules(mint: &AccountInfo) -> Result<Token2022Rules> {
+    if *mint.owner != spl_token_2022::ID {
+        return Ok(Token2022Rules { transfer_fee: false, transfer_hook: false });
+    }
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data)?;
+    let transfer_hook = match state.get_extension::<TransferHook>() {
+        Ok(hook) => {
+            Option::<Pubkey>::from(hook.program_id).is_some() || Option::<Pubkey>::from(hook.authority).is_some()
+        }
+        Err(_) => false,
+    };
+    Ok(Token2022Rules { transfer_fee: state.get_extension::<TransferFeeConfig>().is_ok(), transfer_hook })
+}
+
+// Moves everything in the vault to `to` and closes it (rent to `rent_to`), signing as the escrow PDA. The whole
+// balance, not `escrow.amount`: with a permanent delegate the issuer may have moved tokens out meanwhile.
 fn release_vault<'info>(
     escrow: &Account<'info, Escrow>,
-    vault: &Account<'info, TokenAccount>,
-    to: &Account<'info, TokenAccount>,
+    vault: &InterfaceAccount<'info, TokenAccount>,
+    mint: &InterfaceAccount<'info, Mint>,
+    to: &InterfaceAccount<'info, TokenAccount>,
     rent_to: &AccountInfo<'info>,
-    token_program: &Program<'info, Token>,
+    token_program: &Interface<'info, TokenInterface>,
 ) -> Result<()> {
     let id = escrow.id.to_le_bytes();
     let seeds: &[&[u8]] = &[ESCROW_SEED, escrow.sender.as_ref(), &id, &[escrow.bump]];
     let signer = &[seeds];
-    token::transfer(
-        CpiContext::new_with_signer(
-            token_program.to_account_info(),
-            Transfer {
-                from: vault.to_account_info(),
-                to: to.to_account_info(),
-                authority: escrow.to_account_info(),
-            },
-            signer,
-        ),
-        escrow.amount,
-    )?;
-    token::close_account(CpiContext::new_with_signer(
+    if vault.amount > 0 {
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                token_program.to_account_info(),
+                TransferChecked {
+                    from: vault.to_account_info(),
+                    mint: mint.to_account_info(),
+                    to: to.to_account_info(),
+                    authority: escrow.to_account_info(),
+                },
+                signer,
+            ),
+            vault.amount,
+            mint.decimals,
+        )?;
+    }
+    // Fees withheld in the vault when it received the tokens would block closing it: move them to the mint
+    // (permissionless; the client passes the mint as writable for these tokens).
+    if token_2022_rules(&mint.to_account_info())?.transfer_fee {
+        token_interface::harvest_withheld_tokens_to_mint(
+            CpiContext::new(
+                token_program.to_account_info(),
+                HarvestWithheldTokensToMint {
+                    token_program_id: token_program.to_account_info(),
+                    mint: mint.to_account_info(),
+                },
+            ),
+            vec![vault.to_account_info()],
+        )?;
+    }
+    token_interface::close_account(CpiContext::new_with_signer(
         token_program.to_account_info(),
         CloseAccount {
             account: vault.to_account_info(),
@@ -247,9 +317,9 @@ pub struct SendToken<'info> {
     /// CHECK: any address. It only has to sign the claim to receive the tokens.
     #[account(constraint = recipient.key() != sender.key() @ SafeSendError::SelfTransfer)]
     pub recipient: UncheckedAccount<'info>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = sender)]
-    pub sender_token: Box<Account<'info, TokenAccount>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = mint, token::authority = sender, token::token_program = token_program)]
+    pub sender_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init,
         payer = sender,
@@ -265,9 +335,10 @@ pub struct SendToken<'info> {
         bump,
         token::mint = mint,
         token::authority = escrow,
+        token::token_program = token_program,
     )]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -278,15 +349,17 @@ pub struct ClaimToken<'info> {
     /// CHECK: checked by `has_one = sender`; gets the rent of the escrow and the vault back.
     #[account(mut)]
     pub sender: UncheckedAccount<'info>,
-    pub mint: Box<Account<'info, Mint>>,
+    /// Writable only for mints with a transfer fee (the withheld fees are harvested to it).
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     // Normally created at send time by the client; created here (paid by the recipient) only if missing.
     #[account(
         init_if_needed,
         payer = recipient,
         associated_token::mint = mint,
         associated_token::authority = recipient,
+        associated_token::token_program = token_program,
     )]
-    pub recipient_token: Box<Account<'info, TokenAccount>>,
+    pub recipient_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         has_one = recipient @ SafeSendError::NotRecipient,
@@ -298,8 +371,8 @@ pub struct ClaimToken<'info> {
     )]
     pub escrow: Box<Account<'info, Escrow>>,
     #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -308,14 +381,16 @@ pub struct ClaimToken<'info> {
 pub struct CancelToken<'info> {
     #[account(mut)]
     pub sender: Signer<'info>,
-    pub mint: Box<Account<'info, Mint>>,
+    /// Writable only for mints with a transfer fee (the withheld fees are harvested to it).
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init_if_needed,
         payer = sender,
         associated_token::mint = mint,
         associated_token::authority = sender,
+        associated_token::token_program = token_program,
     )]
-    pub sender_token: Box<Account<'info, TokenAccount>>,
+    pub sender_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         has_one = sender @ SafeSendError::NotSender,
@@ -326,8 +401,8 @@ pub struct CancelToken<'info> {
     )]
     pub escrow: Box<Account<'info, Escrow>>,
     #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -346,4 +421,6 @@ pub enum SafeSendError {
     WrongAsset,
     #[msg("The escrow holds less than the transfer amount")]
     InsufficientEscrow,
+    #[msg("Tokens with a transfer hook are not supported")]
+    UnsupportedToken,
 }

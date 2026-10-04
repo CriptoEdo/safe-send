@@ -89,28 +89,54 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await wait(1500);
     check('cancelled transfer stays gone', !text('.segments').includes('Pending 1'), text('.segments'));
 
-    // Tokens: send to B, add B, switch, claim
+    // Tokens: an SPL token and a Token-2022 token with a 1% transfer fee to B, a hook token refused; then B claims
     const mint = await h.mintTokens(0, 100);
+    const feeMint = await h.mintToken2022(0, 50, { feeBasisPoints: 100 });
+    const hookMint = await h.mintToken2022(0, 5, { hook: true });
     await wait(21_000); // tabs reload from the network at most every 20 s
     click('[data-tab="incoming"]'); click('[data-tab="send"]');
-    await until(() => [...($('#asset') as HTMLSelectElement).options].some((o) => o.value === mint), 'token listed');
+    await until(() => [mint, feeMint, hookMint].every((m) => [...($('#asset') as HTMLSelectElement).options].some((o) => o.value === m)), 'tokens listed');
     pick('#asset', mint);
     check('token balance', text('#balance').includes('100'), text('#balance'));
+    check('no note for a plain token', text('#token-note') === '', text('#token-note'));
     type('#amount', '7.25'); type('#recipient', B);
     await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B token');
     click('#send');
     await until(() => $('#send-result .ok'), 'token sent');
+
+    pick('#asset', hookMint);
+    check('hook token: warned', text('#token-note').includes('transfer hook'), text('#token-note'));
+    type('#amount', '1'); type('#recipient', B);
+    await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B hook');
+    const signsBeforeHook = h.controls.signs;
+    click('#send');
+    check('hook token: refused before signing', text('#send-result').includes('not support') && h.controls.signs === signsBeforeHook, text('#send-result'));
+
+    pick('#asset', feeMint);
+    check('fee token: warned', text('#token-note').includes('1% fee'), text('#token-note'));
+    type('#amount', '10'); type('#recipient', B);
+    await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B fee token');
+    click('#send');
+    await until(() => $('#send-result .ok, #send-result .error'), 'fee token sent');
+    check('fee token sent', !!$('#send-result .ok'), text('#send-result'));
     const messages = h.controls.messages;
     h.select(1); // a new account in Phantom: approved with Phantom's popup, the app follows it
     await until(() => text('.top').includes(B.slice(0, 4)), 'B followed');
     check('switching in Phantom follows the account, no message to sign', h.controls.messages === messages, String(h.controls.messages - messages));
-    await until(() => text('.segments').includes('Receive 1'), 'B incoming');
+    await until(() => text('.segments').includes('Receive 2'), 'B incoming');
+    click('[data-tab="incoming"]');
+    check('fee token shows what the escrow holds', text('.view').includes('9.9 '), text('.view'));
     // Phantom revokes the site behind the app's back (as in Phantom's settings): Claim re-approves, then signs
     localStorage.setItem('harness:trusted', '[]');
-    click('[data-tab="incoming"]'); click('[data-claim]');
-    await until(() => $('#list-result .ok, #list-result .error'), 'token claim');
-    check('claim after Phantom revoked the site', !!$('#list-result .ok'), text('#list-result'));
+    for (const m of [mint, feeMint]) {
+      const row = [...document.querySelectorAll<HTMLElement>('#app .item')].find((el) => el.querySelector(`.mint[title="${m}"]`));
+      row!.querySelector<HTMLButtonElement>('[data-claim]')!.click();
+      await until(() => $('#list-result .ok, #list-result .error'), `claim ${m.slice(0, 4)}`);
+      check(`claim ${m === mint ? 'SPL token' : 'fee token'}`, !!$('#list-result .ok'), text('#list-result'));
+      await wait(300);
+    }
     check('token claimed', (await h.tokenBalance(1, mint)) === 7.25);
+    check('fee token claimed: 10 - 1% - 1%', (await h.tokenBalance(1, feeMint)) === 9.801, String(await h.tokenBalance(1, feeMint)));
 
     // Switch back via the list, then disconnect: no reconnect without a signature
     click('[data-menu]'); click(`.menu [data-use="${A}"]`); await wait(100);
