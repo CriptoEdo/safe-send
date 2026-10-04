@@ -846,15 +846,31 @@ phantom()?.on('accountChanged', async (key) => {
 
 // Back on the page (e.g. after using Phantom's side panel or popup): if Phantom now has another connected wallet
 // selected, switch to it. Phantom does not always send accountChanged, so this checks directly.
+let following = false;
 async function followSelected(): Promise<void> {
-  if (!state.wallet || connecting || approving || state.busy) return;
-  const selected = (await selectedAccount())?.toBase58();
-  if (selected && selected !== state.wallet?.toBase58() && connectedWallets().includes(selected) && !isDisconnected(selected)) {
-    activate(selected);
+  if (!state.wallet || connecting || approving || state.busy || following) return;
+  following = true;
+  try {
+    const selected = (await selectedAccount())?.toBase58();
+    if (selected && selected !== state.wallet?.toBase58() && connectedWallets().includes(selected) && !isDisconnected(selected)) {
+      activate(selected);
+    }
+  } finally {
+    following = false;
   }
 }
 window.addEventListener('focus', () => void followSelected());
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void followSelected(); });
+
+// While the page is visible, keep watching Phantom so a switch made in its side panel shows up within a second,
+// without a click. Both checks talk only to the extension (no RPC): every 0.5 s the account Phantom exposes on
+// the page, and every 1.5 s, in case that is not updated, the account it has selected.
+const watching = () => document.visibilityState === 'visible' && !!state.wallet;
+setInterval(() => {
+  const exposed = phantom()?.publicKey?.toString();
+  if (watching() && exposed && exposed !== state.wallet?.toBase58()) void followSelected();
+}, 500);
+setInterval(() => { if (watching()) void followSelected(); }, 1_500);
 
 render();
 // Back on the page: resume with the account selected in Phantom, unless the user disconnected.
