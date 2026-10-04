@@ -48,6 +48,12 @@ Checks: only the recipient can claim (`NotRecipient`), only the sender can cance
 cd app
 npm install
 npm run dev          # http://localhost:5173 (uses Devnet; VITE_RPC_URL to change the RPC)
+```
+
+On Vercel the app uses `VITE_HELIUS_DEVNET_RPC_URL` (Helius Devnet RPC, key restricted to our domains in Helius;
+`VITE_` values are public by design). `HELIUS_MAINNET_RPC_URL` is a server-only secret kept for a future mainnet RPC proxy.
+
+```bash
 npm run build        # static files in app/dist, deployable on Vercel, Netlify or GitHub Pages
 ```
 

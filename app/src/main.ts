@@ -8,7 +8,9 @@ import {
 } from './lib/safeSend.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
-const RPC_URL = import.meta.env.VITE_RPC_URL ?? 'https://api.devnet.solana.com';
+// Helius Devnet RPC from Vercel (public by design: VITE_ variables end up in the page; the key is restricted to
+// our domains in Helius). VITE_RPC_URL overrides it, e.g. a local validator for the UI tests.
+const RPC_URL = import.meta.env.VITE_RPC_URL ?? import.meta.env.VITE_HELIUS_DEVNET_RPC_URL ?? 'https://api.devnet.solana.com';
 // Rate limits are retried below with a bounded number of attempts, not by web3.js's own open-ended backoff.
 const connection = new Connection(RPC_URL, { commitment: 'confirmed', disableRetryOnRateLimit: true });
 const app = document.getElementById('app')!;
