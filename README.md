@@ -50,6 +50,8 @@ npm install
 npm run dev          # http://localhost:5173 (uses Devnet; VITE_RPC_URL to change the RPC)
 ```
 
+Network: `VITE_CLUSTER=mainnet-beta` builds the Mainnet app (default `devnet`). On Mainnet the browser calls this site's `/api/rpc` Vercel function (`app/api/rpc.ts`), which forwards only the app's RPC methods (getProgramAccounts only on this program, only from the site's origins) to `HELIUS_MAINNET_RPC_URL`, a server-only secret. Locally: `HELIUS_MAINNET_RPC_URL=<rpc> node scripts/dev-rpc-proxy.ts` and `DEV_API_PROXY=http://127.0.0.1:8790 VITE_CLUSTER=mainnet-beta npx vite`. Transactions are confirmed by polling their status (no websocket needed).
+
 On Vercel the app uses `VITE_HELIUS_DEVNET_RPC_URL` (Helius Devnet RPC, key restricted to our domains in Helius;
 `VITE_` values are public by design). `HELIUS_MAINNET_RPC_URL` is a server-only secret kept for a future mainnet RPC proxy.
 

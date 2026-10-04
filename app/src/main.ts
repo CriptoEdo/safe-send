@@ -10,9 +10,7 @@ import {
 import { MAX_PRIORITY_LAMPORTS, claimPriorityCap, computeBudget } from './lib/fees.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
-// Helius Devnet RPC from Vercel (public by design: VITE_ variables end up in the page; the key is restricted to
-// our domains in Helius). VITE_RPC_URL overrides it, e.g. a local validator for the UI tests.
-const RPC_URL = import.meta.env.VITE_RPC_URL ?? import.meta.env.VITE_HELIUS_DEVNET_RPC_URL ?? 'https://api.devnet.solana.com';
+import { IS_MAINNET, NETWORK_NAME, RPC_URL, explorer } from './network.ts';
 // Rate limits are retried below with a bounded number of attempts, not by web3.js's own open-ended backoff.
 const connection = new Connection(RPC_URL, { commitment: 'confirmed', disableRetryOnRateLimit: true });
 const app = document.getElementById('app')!;
@@ -57,7 +55,6 @@ const closed = new Set<string>();
 
 const escape = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const short = (k: PublicKey | string) => { const s = k.toString(); return `${s.slice(0, 4)}…${s.slice(-4)}`; };
-const explorer = (kind: 'tx' | 'address', id: string) => `https://explorer.solana.com/${kind}/${id}?cluster=devnet`;
 const date = (ms: number) => new Date(ms).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
 
 function units(value: bigint, decimals: number): string {
@@ -96,7 +93,7 @@ function describeError(err: unknown): string {
   if (/User rejected|rejected the request/i.test(text)) return 'You rejected the request in Phantom.';
   if (/not been authorized/i.test(text)) return 'Phantom has not connected this account to Safe Send. Approve the connection in Phantom and try again.';
   if (/block height exceeded|expired/i.test(text)) return 'The transaction expired before it was confirmed. Nothing was sent: try again.';
-  if (/failed to fetch|network|429|timed? ?out/i.test(text)) return 'Could not reach Solana Devnet. Check your connection and try again.';
+  if (/failed to fetch|network|429|timed? ?out/i.test(text)) return `Could not reach ${NETWORK_NAME}. Check your connection and try again.`;
   const logs = err instanceof SendTransactionError ? (err.logs ?? []).join('\n') : text;
   const anchor = /Error Message: ([^.\n]+)/.exec(logs);
   if (anchor) return `${anchor[1]}.`;
@@ -114,7 +111,7 @@ function withTimeout<T>(promise: Promise<T>): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// The public Devnet RPC rejects bursts of requests: retry a failed call a couple of times before giving up.
+// Public RPCs reject bursts of requests: retry a failed call a couple of times before giving up.
 async function retry<T>(call: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -256,7 +253,7 @@ function header(): string {
     : ''; // not connected: the welcome screen has the connect button
   return `
     <header class="top">
-      <div class="brand"><span class="logo">${SHIELD}</span>Safe Send<span class="chip">Devnet</span></div>
+      <div class="brand"><span class="logo">${SHIELD}</span>Safe Send${IS_MAINNET ? '' : '<span class="chip">Devnet</span>'}</div>
       ${right}
     </header>`;
 }
@@ -302,7 +299,7 @@ function welcome(): string {
         ${wallets.map((w) => `<button class="wallet-row" data-use="${w}"><span class="avatar small"></span>${short(w)}</button>`).join('')}
       </div>` : ''}
       <button class="pill primary big" data-connect>${!phantom() ? 'Get Phantom' : wallets.length ? 'Connect another wallet' : 'Connect Phantom'}</button>
-      <p class="hint">Connecting asks for a free signature. Use Devnet: Phantom → Settings → Developer settings → Testnet mode</p>
+      <p class="hint">Connecting asks for a free signature.${IS_MAINNET ? '' : ' Use Devnet: Phantom → Settings → Developer settings → Testnet mode'}</p>
     </section>`;
 }
 
@@ -314,7 +311,7 @@ function tabs(): string {
 
 // A failed refresh: the data on screen may be old.
 const status = () => `<div id="status">${state.loadError
-  ? `<div class="notice error status-error">Could not reach Solana Devnet${state.loaded ? ', balances may be out of date' : ''}. <button class="link-button" data-retry>Retry</button></div>`
+  ? `<div class="notice error status-error">Could not reach ${NETWORK_NAME}${state.loaded ? ', balances may be out of date' : ''}. <button class="link-button" data-retry>Retry</button></div>`
   : ''}</div>`;
 
 // The asset in the form, or SOL if that token is no longer in the wallet.
@@ -491,7 +488,7 @@ async function checkRecipient(): Promise<void> {
       : '✓ The recipient can pay the claim fee.');
   } catch {
     if (token !== checkToken) return;
-    showCheck('error', 'Could not check this address: Solana Devnet did not answer. <button class="link-button" data-recheck>Try again</button>');
+    showCheck('error', `Could not check this address: ${NETWORK_NAME} did not answer. <button class="link-button" data-recheck>Try again</button>`);
   }
 }
 

@@ -164,7 +164,33 @@ export async function signAndSend(connection: Connection, tx: Transaction, feePa
     signed = await provider.signTransaction(tx);
   }
   const signature = await connection.sendRawTransaction(signed.serialize());
-  const result = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (result.value.err) throw new Error(`Transaction failed: ${JSON.stringify(result.value.err)}`);
+  await confirm(connection, signature, lastValidBlockHeight);
   return signature;
+}
+
+// Waits until the transaction is confirmed by polling its status, so it works through an HTTP-only RPC (the
+// Mainnet /api/rpc proxy has no websocket). Fails if it errored, or expired (its blockhash is too old to land).
+async function confirm(connection: Connection, signature: string, lastValidBlockHeight: number): Promise<void> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      const { value: [status] } = await connection.getSignatureStatuses([signature]);
+      if (status?.err) throw new TransactionFailed(status.err);
+      if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return;
+      if ((await connection.getBlockHeight('confirmed')) > lastValidBlockHeight) {
+        throw new Error('Transaction expired: block height exceeded');
+      }
+    } catch (err) {
+      if (err instanceof TransactionFailed || /expired/.test(String(err))) throw err;
+      // A failed status request: try again
+    }
+    await new Promise((r) => setTimeout(r, 1_000));
+  }
+  throw new Error(`Transaction not confirmed in time: check it on the explorer (${signature})`);
+}
+
+class TransactionFailed extends Error {
+  constructor(err: unknown) {
+    super(`Transaction failed: ${JSON.stringify(err)}`);
+  }
 }
