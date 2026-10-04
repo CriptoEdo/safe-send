@@ -40,6 +40,9 @@ const provider = {
   },
   async signTransaction(tx: Transaction) {
     const signer = selected()!; // the account shown in the approval popup, even if the user switches meanwhile
+    if (!trusted().has(signer.publicKey.toBase58())) {
+      throw Object.assign(new Error('The requested method and/or account has not been authorized by the user.'), { code: 4100 });
+    }
     await new Promise((r) => setTimeout(r, controls.signDelayMs));
     if (controls.rejectNext) { controls.rejectNext = false; throw new Error('User rejected the request.'); }
     controls.signs++;

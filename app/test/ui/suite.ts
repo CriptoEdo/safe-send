@@ -105,8 +105,11 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await until(() => text('.top').includes(B.slice(0, 4)), 'B followed');
     check('switching in Phantom follows the account, no message to sign', h.controls.messages === messages, String(h.controls.messages - messages));
     await until(() => text('.segments').includes('Receive 1'), 'B incoming');
+    // Phantom revokes the site behind the app's back (as in Phantom's settings): Claim re-approves, then signs
+    localStorage.setItem('harness:trusted', '[]');
     click('[data-tab="incoming"]'); click('[data-claim]');
-    await until(() => $('#list-result .ok'), 'token claim');
+    await until(() => $('#list-result .ok, #list-result .error'), 'token claim');
+    check('claim after Phantom revoked the site', !!$('#list-result .ok'), text('#list-result'));
     check('token claimed', (await h.tokenBalance(1, mint)) === 7.25);
 
     // Switch back via the list, then disconnect: no reconnect without a signature

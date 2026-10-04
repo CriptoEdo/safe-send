@@ -88,6 +88,7 @@ function amountLabel(t: PendingTransfer): string {
 function describeError(err: unknown): string {
   const text = String((err as Error)?.message ?? err);
   if (/User rejected|rejected the request/i.test(text)) return 'You rejected the request in Phantom.';
+  if (/not been authorized/i.test(text)) return 'Phantom has not connected this account to Safe Send. Approve the connection in Phantom and try again.';
   if (/block height exceeded|expired/i.test(text)) return 'The transaction expired before it was confirmed. Nothing was sent: try again.';
   if (/failed to fetch|network|429|timed? ?out/i.test(text)) return 'Could not reach Solana Devnet. Check your connection and try again.';
   const logs = err instanceof SendTransactionError ? (err.logs ?? []).join('\n') : text;

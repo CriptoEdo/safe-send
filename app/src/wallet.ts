@@ -126,14 +126,43 @@ export async function disconnectWallet(wallet: string): Promise<void> {
   await phantom()?.disconnect().catch(() => {});
 }
 
+const short = (k: string) => `${k.slice(0, 4)}…${k.slice(-4)}`;
+
+// Phantom error 4100: the site is not authorized for the selected account (e.g. revoked in Phantom's settings).
+const notAuthorized = (err: unknown) =>
+  (err as { code?: number })?.code === 4100 || /not been authorized/i.test(String((err as Error)?.message ?? err));
+
+// Makes sure Phantom has authorized this site for `wallet` before asking it to sign: silently when it still
+// trusts the site, otherwise with Phantom's approval popup. Phantom signs with its selected account, so that
+// must be `wallet`.
+async function ensureAuthorized(provider: PhantomProvider, wallet: PublicKey, popup: boolean): Promise<void> {
+  let key: string | null = null;
+  if (!popup) {
+    try { key = (await provider.connect({ onlyIfTrusted: true })).publicKey.toString(); } catch { /* not trusted */ }
+  }
+  if (!key) key = (await provider.connect()).publicKey.toString();
+  if (key !== wallet.toBase58()) {
+    throw new Error(`Phantom has ${short(key)} selected. Select ${short(wallet.toBase58())} in Phantom and try again.`);
+  }
+}
+
 // Signs with Phantom, sends, and waits for confirmation. Returns the signature.
 export async function signAndSend(connection: Connection, tx: Transaction, feePayer: PublicKey): Promise<string> {
   const provider = phantom();
   if (!provider) throw new Error('Phantom not found');
+  await ensureAuthorized(provider, feePayer, false);
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
   tx.recentBlockhash = blockhash;
   tx.feePayer = feePayer;
-  const signed = await provider.signTransaction(tx);
+  let signed: Transaction;
+  try {
+    signed = await provider.signTransaction(tx);
+  } catch (err) {
+    if (!notAuthorized(err)) throw err;
+    // Phantom dropped the authorization meanwhile: approve again, then sign once more.
+    await ensureAuthorized(provider, feePayer, true);
+    signed = await provider.signTransaction(tx);
+  }
   const signature = await connection.sendRawTransaction(signed.serialize());
   const result = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
   if (result.value.err) throw new Error(`Transaction failed: ${JSON.stringify(result.value.err)}`);
