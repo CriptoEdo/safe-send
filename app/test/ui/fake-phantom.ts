@@ -19,7 +19,9 @@ const selected = (): Keypair | null => keys()[load('selected', 0)] ?? null;
 const trusted = () => new Set(load<string[]>('trusted', []));
 
 const handlers: ((key: PublicKey | null) => void)[] = [];
-const controls = { rejectNext: false, signDelayMs: 0, signs: 0, messages: 0 };
+// silentUntrusted: like the real Phantom side panel, no accountChanged when switching to an account that never
+// connected; silentAll: no accountChanged at all (the app must notice on focus).
+const controls = { rejectNext: false, signDelayMs: 0, signs: 0, messages: 0, silentUntrusted: false, silentAll: false };
 
 const provider = {
   isPhantom: true,
@@ -104,6 +106,7 @@ const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
     save('selected', i);
     const k = keys()[i];
     const key = trusted().has(k.publicKey.toBase58()) ? k.publicKey : null;
+    if (controls.silentAll || (controls.silentUntrusted && !key)) return;
     handlers.forEach((h) => h(key));
   },
   balance: (i: number) => connection.getBalance(keys()[i].publicKey),

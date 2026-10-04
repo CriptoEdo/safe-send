@@ -203,6 +203,32 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await until(() => $('#send-result .ok, #send-result .error'), 'send back');
     check('send back from the second wallet', !!$('#send-result .ok'), text('#send-result'));
 
+    // Real Phantom (side panel) may not announce a switch to an account that never connected: the add banner's
+    // Connect button connects the account selected in Phantom
+    const cIndex = await h.addEmptyAccount();
+    const C = h.address(cIndex);
+    h.controls.silentUntrusted = true;
+    click('[data-menu]'); click('[data-add]'); await wait(100);
+    click('.switch-hint [data-connect]'); // B still selected in Phantom
+    await until(() => text('.switch-hint').includes('still has'), 'still selected hint');
+    check('add: says when Phantom still has the active wallet selected', text('.switch-hint').includes(B.slice(0, 4)), text('.switch-hint'));
+    h.select(cIndex); await wait(300);
+    check('add: no event from Phantom, still on B', text('.top').includes(B.slice(0, 4)), text('.top'));
+    click('.switch-hint [data-connect]');
+    await until(() => text('.top').includes(C.slice(0, 4)), 'C connected with the button');
+    check('add: Connect connects the account selected in Phantom', true);
+    h.controls.silentUntrusted = false;
+    // No event at all when switching back to a connected wallet: the app notices when the page gets focus
+    h.controls.silentAll = true;
+    h.select(1); window.dispatchEvent(new Event('focus'));
+    await until(() => text('.top').includes(B.slice(0, 4)), 'B followed on focus');
+    check('switch noticed on focus without an event', true);
+    h.controls.silentAll = false;
+    // Remove C again (the checks below expect A and B only)
+    h.select(cIndex); await until(() => text('.top').includes(C.slice(0, 4)), 'C active');
+    click('[data-menu]'); click('[data-disconnect]'); await wait(200);
+    h.select(1); await until(() => text('.top').includes(B.slice(0, 4)), 'back to B again');
+
     // Disconnect B only: A stays connected, B needs a new signature
     click('[data-menu]'); click('[data-disconnect]'); await wait(200);
     check('disconnect removes only that wallet', text('.wallet-list').includes(A.slice(0, 4)) && !text('.wallet-list').includes(B.slice(0, 4)), text('.wallet-list'));

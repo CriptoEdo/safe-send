@@ -40,7 +40,7 @@ const state = {
   // selected account, a website cannot change it).
   pending: null as string | null,
   // Shown above the content: how to add a wallet, or the account selected in Phantom is not connected here.
-  notice: null as null | { kind: 'add' } | { kind: 'not-connected'; account: string | null },
+  notice: null as null | { kind: 'add'; stillSelected?: string } | { kind: 'not-connected'; account: string | null },
   // The send form and its checks live here so re-rendering never loses what the user typed.
   form: emptyForm(),
   fee: null as null | { recipient: string; check: FeeCheck }, // fee check of the recipient in the form
@@ -270,9 +270,13 @@ function walletNotice(): string {
     </div>`;
   }
   if (state.notice?.kind === 'add') {
+    // Phantom does not always tell the site about a switch to an account that never connected (e.g. from its
+    // side panel), so the user confirms with Connect once the account is selected.
+    const still = state.notice.stillSelected;
     return `<div class="switch-hint">
       <strong>Add another wallet</strong>
-      Select the other account in Phantom: Safe Send switches to it automatically.
+      ${still ? `Phantom still has ${short(still)} selected: select the other account at the top of Phantom first.` : 'Select the other account in Phantom, then connect it here.'}
+      <button class="pill primary small" data-connect>Connect</button>
     </div>`;
   }
   if (state.notice?.kind === 'not-connected') {
@@ -778,7 +782,13 @@ async function connectNew(): Promise<void> {
     const selected = (await selectedAccount())?.toBase58();
     const needsSignature = connectedWallets().length === 0 || (!!selected && isDisconnected(selected));
     const wallet = needsSignature ? await connectWithSignature() : await approveAccount();
-    if (wallet) activate(wallet.toBase58());
+    if (wallet && state.notice?.kind === 'add' && state.wallet?.equals(wallet)) {
+      // Adding a wallet, but Phantom still has the active one selected
+      state.notice = { kind: 'add', stillSelected: wallet.toBase58() };
+      render();
+    } else if (wallet) {
+      activate(wallet.toBase58());
+    }
   } finally {
     connecting = false;
   }
@@ -833,6 +843,18 @@ phantom()?.on('accountChanged', async (key) => {
     approving = false;
   }
 });
+
+// Back on the page (e.g. after using Phantom's side panel or popup): if Phantom now has another connected wallet
+// selected, switch to it. Phantom does not always send accountChanged, so this checks directly.
+async function followSelected(): Promise<void> {
+  if (!state.wallet || connecting || approving || state.busy) return;
+  const selected = (await selectedAccount())?.toBase58();
+  if (selected && selected !== state.wallet?.toBase58() && connectedWallets().includes(selected) && !isDisconnected(selected)) {
+    activate(selected);
+  }
+}
+window.addEventListener('focus', () => void followSelected());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void followSelected(); });
 
 render();
 // Back on the page: resume with the account selected in Phantom, unless the user disconnected.
